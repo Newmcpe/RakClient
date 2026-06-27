@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -50,15 +50,6 @@ struct Cli {
     )]
     client_version: String,
 
-    /// Milliseconds to wait after `InitGame` before requesting spawn, letting a script's post-join
-    /// packets land first (Arizona needs ~1200). `0` requests the class immediately.
-    #[arg(
-        long = "spawn-delay-ms",
-        env = "RAKCLIENT_SPAWN_DELAY_MS",
-        default_value_t = 0
-    )]
-    spawn_delay_ms: u64,
-
     /// Display resolution `WxH` exposed to scripts as `sampResolutionW` / `sampResolutionH`.
     #[arg(long, env = "RAKCLIENT_RESOLUTION", default_value = "1920x1080")]
     resolution: String,
@@ -67,10 +58,14 @@ struct Cli {
     #[arg(long = "no-aim-sync", env = "RAKCLIENT_NO_AIM_SYNC")]
     no_aim_sync: bool,
 
-    /// Path to a Lua script to load. The script's `onChatMessage`/`onServerMessage` callbacks are
-    /// invoked as those events arrive.
-    #[arg(long, env = "RAKCLIENT_SCRIPT")]
-    script: Option<PathBuf>,
+    /// Directory of Lua/Luau scripts to auto-load — every `*.lua`/`*.luau` in it is loaded into one
+    /// engine. A missing or empty directory runs a vanilla client with no scripts.
+    #[arg(
+        long = "scripts-dir",
+        env = "RAKCLIENT_SCRIPTS_DIR",
+        default_value = "scripts"
+    )]
+    scripts_dir: PathBuf,
 }
 
 impl Cli {
@@ -86,7 +81,6 @@ impl Cli {
             gpci: None,
             sync_interval: Duration::from_millis(200),
             reconnect_delay: Duration::from_secs(5),
-            post_join_delay: Duration::from_millis(self.spawn_delay_ms),
             aim_sync: !self.no_aim_sync,
         })
     }
@@ -114,19 +108,26 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Load and initialise the Lua engine from `path`, or return `None` when no script was requested.
-fn load_script_engine(path: Option<PathBuf>) -> anyhow::Result<Option<ScriptEngine>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let source = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading script `{}`", path.display()))?;
-    let engine = ScriptEngine::new().map_err(|e| anyhow!("initialising lua: {e}"))?;
-    engine
-        .load_script(&source, &path.display().to_string())
-        .map_err(|e| anyhow!("loading script `{}`: {e}", path.display()))?;
-    info!(script = %path.display(), "lua script loaded");
-    Ok(Some(engine))
+/// Collect loadable Lua/Luau scripts from `dir`, sorted by name for a deterministic load order. A
+/// missing directory yields an empty list (not an error), so running without scripts is valid.
+fn collect_scripts(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading scripts dir `{}`", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("lua") | Some("luau")
+                )
+        })
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 /// Forward decoded events into the script's matching callbacks.
@@ -160,13 +161,20 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let engine = load_script_engine(cli.script.clone())?.map(Rc::new);
     let resolution = cli.resolution()?;
+    let scripts = collect_scripts(&cli.scripts_dir)?;
     let config = cli.into_config()?;
-    info!(server = %config.server, nick = %config.nick, "connecting");
+    info!(server = %config.server, nick = %config.nick, scripts = scripts.len(), "connecting");
 
-    // With a script loaded, register it as a catch-all RPC handler so every incoming/outgoing RPC
-    // reaches its `sampev.onX` callback (and can be dropped/rewritten) before the FSM.
+    // Build one engine for every script in the scripts dir; with none, run a vanilla client.
+    let engine: Option<Rc<ScriptEngine>> = if scripts.is_empty() {
+        None
+    } else {
+        Some(Rc::new(
+            ScriptEngine::new().map_err(|e| anyhow!("initialising lua: {e}"))?,
+        ))
+    };
+
     let mut client = match &engine {
         Some(engine) => {
             let mut registry = PacketRegistry::new();
@@ -188,6 +196,15 @@ async fn main() -> anyhow::Result<()> {
             engine
                 .set_global("sampNick", config.nick.clone())
                 .map_err(|e| anyhow!("setting sampNick: {e}"))?;
+            // Load each script now that bindings/globals are in place (a script may use them on load).
+            for path in &scripts {
+                let source = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading script `{}`", path.display()))?;
+                engine
+                    .load_script(&source, &path.display().to_string())
+                    .map_err(|e| anyhow!("loading script `{}`: {e}", path.display()))?;
+                info!(script = %path.display(), "lua script loaded");
+            }
             // Lifecycle hooks: the script sends its own connect/init packets in FSM sequence.
             let on_connect = engine.clone();
             registry.on_lifecycle("onConnect", move || on_connect.fire("onConnect", ()));
@@ -265,8 +282,8 @@ mod tests {
         assert_eq!(cli.password, None);
         assert_eq!(cli.class, 0);
         assert_eq!(cli.client_version, "0.3.7-R3");
-        assert_eq!(cli.spawn_delay_ms, 0); // vanilla: request class immediately
         assert_eq!(cli.resolution, "1920x1080");
+        assert_eq!(cli.scripts_dir, PathBuf::from("scripts"));
     }
 
     #[test]

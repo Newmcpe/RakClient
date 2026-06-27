@@ -40,12 +40,12 @@ cargo build --workspace
 cargo run -p app -- --server <хост:порт> --nick ВашНик
 ```
 
-Для серверов **Arizona** эмуляция (CEF/валидация) живёт в Lua, а не в Rust — загрузите лаунчер и
-дайте его пакетам дойти до сервера через `--spawn-delay-ms`:
+Для серверов **Arizona** эмуляция (CEF/валидация) живёт в Lua, а не в Rust. Подгрузите папку с
+лаунчером — тайминг отправки валидации задаёт сам скрипт через `wait()`:
 
 ```sh
 cargo run -p app -- --server bumblebee.arizona-rp.com:7777 --nick ВашНик \
-  --script example_scripts/arizona_launcher_emulation.luau --spawn-delay-ms 1200
+  --scripts-dir example_scripts
 ```
 
 Если у аккаунта есть пароль для входа (диалог авторизации на сервере), добавьте его:
@@ -61,10 +61,11 @@ RUST_LOG=info cargo run -p app -- --server <хост:порт> --nick ВашНи
 # или raknet::transport=trace — чтобы видеть каждый пакет в виде hex
 ```
 
-Подключить Lua-скрипт:
+Скрипты подгружаются автоматически: все файлы `*.lua` / `*.luau` из папки скриптов (по умолчанию
+`scripts/`, переопределяется флагом `--scripts-dir`):
 
 ```sh
-cargo run -p app -- --server <хост:порт> --nick ВашНик --script example_scripts/chat_echo.luau
+cargo run -p app -- --server <хост:порт> --nick ВашНик --scripts-dir example_scripts
 ```
 
 ## Важно про два разных пароля

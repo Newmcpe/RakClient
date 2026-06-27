@@ -58,7 +58,7 @@ Layered workspace; each crate is one seam. Dependencies point downward only.
   the real `raknet`/`samp-proto` in production. `lib.rs` exposes `Client`, `ClientConfig`(+builder),
   `ConnectionState`, `ClientEvent`. The FSM is pumped one event at a time via `Client::next_event()`,
   which internally `select!`s transport events, the on-foot sync interval (while `Spawned`), the
-  reconnect timer, and a generic post-join delay (`ClientConfig.post_join_delay`).
+  reconnect timer, and the script `onUpdate` tick.
 
 - **`app`** — the `rakclient` binary: clap/env config → tracing → pump `next_event()` and log.
 
@@ -94,8 +94,9 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
   and periodically, to self-whitelist its source IP. Without it the server drops all packets.
 - After join, Arizona expects the `220` CEF/validation packet sequence. This now lives in Luau
   (`luau/arizona.luau`, used by the `example_scripts/arizona_launcher_emulation*.luau`), not in Rust.
-  The FSM holds the spawn-class request behind `ClientConfig.post_join_delay` (the app's
-  `--spawn-delay-ms`, ~1200 for Arizona) so those script packets reach the server first.
+  The FSM runs its normal join → class → spawn flow; the script times its own validation via the Lua
+  scheduler's `wait()` (like the reference addon's `newTask`/`wait`), so it lands within the server's
+  validation window without any Rust-side spawn gate.
 - Login uses a `ShowDialog` (`Авторизация`) the driver auto-answers via `RPC_DialogResponse`. **Two
   distinct passwords**: `ClientConfig.password` is the RakNet *connection* password (Arizona has none —
   leave `None`); `account_password` is the login-dialog password. The app flags mirror this:

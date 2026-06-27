@@ -42,7 +42,6 @@ enum Step {
     Event(Option<RakEvent>),
     SyncTick,
     Reconnect,
-    PostJoinDelay,
     Update,
 }
 
@@ -56,9 +55,6 @@ pub(crate) struct Driver<T: Transport, C: Codec> {
     sync: OnFootSync,
     sync_timer: Option<Interval>,
     reconnect_timer: Option<Pin<Box<Sleep>>>,
-    /// One-shot delay after `InitGame` before requesting the spawn class, giving a script's post-join
-    /// packets wall-clock time to reach the server. Armed from `config.post_join_delay` (zero ⇒ off).
-    post_join_timer: Option<Pin<Box<Sleep>>>,
     closed: bool,
     /// Packet-handler registry: scripts/observers intercept RPCs here before the FSM sees them.
     registry: PacketRegistry,
@@ -91,7 +87,6 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             sync: OnFootSync::default(),
             sync_timer: None,
             reconnect_timer: None,
-            post_join_timer: None,
             closed: false,
             registry: PacketRegistry::new(),
             update_timer: None,
@@ -131,7 +126,6 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     pub(crate) async fn disconnect(&mut self) -> raknet::Result<()> {
         self.sync_timer = None;
         self.reconnect_timer = None;
-        self.post_join_timer = None;
         self.closed = true;
         self.transport.disconnect().await
     }
@@ -149,7 +143,6 @@ impl<T: Transport, C: Codec> Driver<T, C> {
                 Step::Event(None) => self.on_transport_closed(),
                 Step::SyncTick => self.on_sync_tick().await,
                 Step::Reconnect => self.on_reconnect().await,
-                Step::PostJoinDelay => self.on_post_join_delay().await,
                 Step::Update => self.registry.tick(),
             }
             self.flush_outbox().await;
@@ -242,20 +235,17 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         let spawned = matches!(self.state, ConnectionState::Spawned);
         let has_reconnect = self.reconnect_timer.is_some();
         let has_sync = self.sync_timer.is_some();
-        let has_delay = self.post_join_timer.is_some();
         let has_update = self.update_timer.is_some();
         let Driver {
             transport,
             sync_timer,
             reconnect_timer,
-            post_join_timer,
             update_timer,
             ..
         } = self;
         tokio::select! {
             biased;
             _ = poll_sleep(reconnect_timer), if has_reconnect => Step::Reconnect,
-            _ = poll_sleep(post_join_timer), if has_delay => Step::PostJoinDelay,
             _ = poll_interval(sync_timer), if spawned && has_sync => Step::SyncTick,
             _ = poll_interval(update_timer), if has_update => Step::Update,
             event = transport.recv(), if !closed => Step::Event(event),
@@ -478,27 +468,12 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             local_id: self.local_id,
             host_name,
         });
-        // Scripts send their post-init packets (e.g. a server's post-join validation) before the
-        // class request; flush immediately so they reach the wire ahead of it.
+        // A script's post-join packets (e.g. a server's validation sequence) go out on `onInitGame`
+        // or on its own Lua `wait()`-timed task; the normal class → spawn flow proceeds immediately.
+        // Servers that need validation only require it within a window, not strictly before spawn.
         self.registry.dispatch_lifecycle("onInitGame");
         self.flush_outbox().await;
-        // Some servers must process a script's post-join packets before the client spawns (Arizona
-        // kicks otherwise). When `post_join_delay` is set, hold the class request behind it so those
-        // packets get wall-clock time; otherwise request the class immediately.
-        if self.config.post_join_delay.is_zero() {
-            self.request_spawn_class().await;
-        } else {
-            self.post_join_timer = Some(Box::pin(time::sleep(self.config.post_join_delay)));
-        }
-    }
-
-    /// Fired once the post-join delay elapses: request the class, resuming the normal class → spawn
-    /// flow.
-    async fn on_post_join_delay(&mut self) {
-        self.post_join_timer = None;
-        if matches!(self.state, ConnectionState::Joined { .. }) {
-            self.request_spawn_class().await;
-        }
+        self.request_spawn_class().await;
     }
 
     async fn request_spawn_class(&mut self) {
@@ -638,7 +613,6 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     fn on_disconnect(&mut self, reason: DisconnectReason) {
-        self.post_join_timer = None;
         if let Some(aim) = self.aim.as_mut() {
             aim.reset();
         }

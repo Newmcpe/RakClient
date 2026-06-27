@@ -58,10 +58,6 @@ pub struct ClientConfig {
     pub gpci: Option<String>,
     pub sync_interval: Duration,
     pub reconnect_delay: Duration,
-    /// Delay after `InitGame` before requesting the spawn class, giving a script's post-join packets
-    /// (e.g. a server's validation sequence) wall-clock time to be processed. `Duration::ZERO` ⇒ no
-    /// delay (request the class immediately). Server-agnostic; the caller sets it per server.
-    pub post_join_delay: Duration,
     /// Send native aim-sync packets (a believable, rate-limited camera/aim) while spawned. Default
     /// `true`; set `false` to send no aim sync.
     pub aim_sync: bool,
@@ -80,7 +76,6 @@ impl ClientConfig {
                 gpci: None,
                 sync_interval: Duration::from_millis(100),
                 reconnect_delay: Duration::from_secs(5),
-                post_join_delay: Duration::ZERO,
                 aim_sync: true,
             },
         }
@@ -121,12 +116,6 @@ impl ClientConfigBuilder {
     }
     pub fn reconnect_delay(mut self, delay: Duration) -> Self {
         self.config.reconnect_delay = delay;
-        self
-    }
-    /// Delay between `InitGame` and the spawn-class request, letting a script's post-join packets
-    /// land first. `Duration::ZERO` (default) requests the class immediately.
-    pub fn post_join_delay(mut self, delay: Duration) -> Self {
-        self.config.post_join_delay = delay;
         self
     }
     pub fn build(self) -> ClientConfig {
