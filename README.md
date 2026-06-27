@@ -38,7 +38,11 @@ cargo run -p app -- --server <host:port> --nick <Nick> [--account-password <pw>]
 
 ```sh
 cargo build --workspace
-./scripts/check.ps1   # the gate: fmt --check + clippy -D warnings + test
+
+# the gate (must be green before claiming completion):
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
 ```
 
 ## Protocol provenance

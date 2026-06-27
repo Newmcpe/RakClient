@@ -14,8 +14,10 @@ bridge for Arizona servers.
 
 ```sh
 cargo build --workspace
-./scripts/check.ps1                       # the gate: fmt --check + clippy -D warnings + test (stops on first failure)
 
+# the gate (all three must pass before claiming completion):
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace                    # all unit/integration tests
 cargo test -p samp-proto                  # one crate
 cargo test -p samp-proto client_join_golden_vector   # one test by name

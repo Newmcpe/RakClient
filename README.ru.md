@@ -87,12 +87,6 @@ cargo run -p app -- --server <хост:порт> --nick ВашНик --script ex
 В проекте есть «ворота качества» — они должны проходить зелёными:
 
 ```sh
-./scripts/check.ps1   # cargo fmt --check + clippy -D warnings + тесты
-```
-
-Или по отдельности:
-
-```sh
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
