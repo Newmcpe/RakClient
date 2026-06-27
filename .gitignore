@@ -1,0 +1,21 @@
+/target
+# OMC session/operational state (must not be committed)
+/.omc/
+# parallel implementation worktrees (provisioned via `git worktree add`)
+/.wt/
+# Serena language-server tool state
+/.serena/
+# JetBrains IDE project files
+/.idea/
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+.DS_Store
+# keep IDA database out of the repo
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/samp-proto",
+    "crates/raknet",
+    "crates/samp-client",
+    "crates/samp-script",
+    "crates/app",
+    "crates/test-support",
+]
+
+# Shared dependency versions. Member crates opt in with `dep.workspace = true`.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio-util = "0.7"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+# Internal crates (path deps).
+samp-proto = { path = "crates/samp-proto" }
+raknet = { path = "crates/raknet" }
+samp-client = { path = "crates/samp-client" }
+samp-script = { path = "crates/samp-script" }
+test-support = { path = "crates/test-support" }
+
+[profile.release]
+lto = "thin"
