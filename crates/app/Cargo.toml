@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+description = "RakClient binary: connect a SA-MP client to a server and run it to Spawned."
+
+[[bin]]
+name = "rakclient"
+path = "src/main.rs"
+
+[dependencies]
+samp-client = { workspace = true }
+samp-proto = { workspace = true }
+samp-script = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
