@@ -1,0 +1,13 @@
+[package]
+name = "test-support"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dev-only test fixtures and a loopback mock SA-MP server for integration tests."
+
+[dependencies]
+raknet = { workspace = true }
+samp-proto = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
