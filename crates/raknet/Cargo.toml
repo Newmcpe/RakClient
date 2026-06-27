@@ -1,0 +1,17 @@
+[package]
+name = "raknet"
+version = "0.1.0"
+edition = "2021"
+description = "SA-MP RakNet 3.x UDP transport: byte cipher, reliable/ordered layer, async peer."
+
+[dependencies]
+samp-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "net", "time", "sync", "macros"] }
