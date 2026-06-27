@@ -114,14 +114,25 @@ fn addon_tasks_run_on_update() {
 }
 
 #[test]
-fn real_new_launcher_emulation_runs() {
+fn classic_arizona_launcher_runs() {
+    assert_arizona_launcher("../../example_scripts/arizona_launcher_emulation_classic.luau");
+}
+
+#[test]
+fn sugar_arizona_launcher_runs() {
+    assert_arizona_launcher("../../example_scripts/arizona_launcher_emulation.luau");
+}
+
+/// Load an Arizona launcher example and assert its `onSendClientJoin` rewrites RPC 25 to the
+/// Arizona 7-field variant and queues the CEF init packets. The classic (raw-byte) and sugar
+/// (typed builder) examples must produce the same observable behaviour.
+fn assert_arizona_launcher(rel_path: &str) {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../example_scripts/new_launcher_emulation.luau");
-    let source = std::fs::read_to_string(&path).expect("read new_launcher_emulation.luau");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel_path}: {e}"));
 
     let engine = ScriptEngine::new().expect("vm");
     let outbox: Outbox = Rc::new(RefCell::new(VecDeque::new()));
@@ -132,11 +143,10 @@ fn real_new_launcher_emulation_runs() {
             "127.0.0.1:7777".parse().expect("addr"),
         ))
         .expect("bindings");
-    // The stock script loads unchanged: require('addon'), require('samp.events'), bitStream, etc.
-    engine.load_script(&source, "new_launcher").expect("load");
+    engine.load_script(&source, rel_path).expect("load");
 
     // A 7-field ClientJoin (RPC 25). onSendClientJoin should rewrite it to the Arizona variant
-    // and queue the two CEF packets via sendcef → bitStream:sendPacket.
+    // and queue the two CEF packets via sendCef → bitStream:sendPacket.
     let join = vec![
         0xD9, 0x0F, 0x00, 0x00, 0x00, 0x03, b'B', b'o', b't', 0x44, 0x33, 0x22, 0x11, 0x00, 0x01,
         b'x', 0x44, 0x33, 0x22, 0x11,
@@ -153,7 +163,6 @@ fn real_new_launcher_emulation_runs() {
         }
         other => panic!("expected rewrite, got {other:?}"),
     }
-    // The two CEF init packets were queued by sendcef.
     let queued = outbox.borrow().len();
     assert!(queued >= 2, "expected 2 CEF packets queued, got {queued}");
 }
