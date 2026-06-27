@@ -12,13 +12,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
-use samp_client::{BotState, Client, ClientConfig, ClientEvent, Direction, PacketRegistry};
+use samp_client::{Client, ClientConfig, ClientEvent, Direction, LocalPlayer, PacketRegistry};
 use samp_proto::ClassId;
 use samp_script::ScriptEngine;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// CLI / environment configuration for the RakClient client.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "rakclient", about = "Async SA-MP 0.3.7 client bot")]
 struct Cli {
@@ -33,10 +32,6 @@ struct Cli {
     /// RakNet server/connection password, if the server has one (not the account password).
     #[arg(long, env = "RAKCLIENT_PASSWORD")]
     password: Option<String>,
-
-    /// Account login password, typed into the server's login dialog.
-    #[arg(long = "account-password", env = "RAKCLIENT_ACCOUNT_PASSWORD")]
-    account_password: Option<String>,
 
     /// Class id to request at spawn selection.
     #[arg(long, env = "RAKCLIENT_CLASS", default_value_t = 0)]
@@ -53,10 +48,6 @@ struct Cli {
     /// Display resolution `WxH` exposed to scripts as `sampResolutionW` / `sampResolutionH`.
     #[arg(long, env = "RAKCLIENT_RESOLUTION", default_value = "1920x1080")]
     resolution: String,
-
-    /// Disable native aim-sync (the believable rate-limited camera/aim sent while spawned).
-    #[arg(long = "no-aim-sync", env = "RAKCLIENT_NO_AIM_SYNC")]
-    no_aim_sync: bool,
 
     /// Directory of Lua/Luau scripts to auto-load — every `*.lua`/`*.luau` in it is loaded into one
     /// engine. A missing or empty directory runs a vanilla client with no scripts.
@@ -75,13 +66,11 @@ impl Cli {
             server,
             nick: self.nick,
             password: self.password,
-            account_password: self.account_password,
             client_version: self.client_version,
             default_class: ClassId(self.class),
             gpci: None,
             sync_interval: Duration::from_millis(200),
             reconnect_delay: Duration::from_secs(5),
-            aim_sync: !self.no_aim_sync,
         })
     }
 
@@ -130,7 +119,6 @@ fn collect_scripts(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Forward decoded events into the script's matching callbacks.
 fn dispatch_to_script(engine: &ScriptEngine, event: &ClientEvent) {
     match event {
         ClientEvent::Chat { player_id, text } => engine.on_chat(player_id.0, text),
@@ -179,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         Some(engine) => {
             let mut registry = PacketRegistry::new();
             // Shared bot state for getBot*/setBot*, mirrored by the driver.
-            let bot_state = BotState::shared(config.nick.clone(), config.server);
+            let bot_state = LocalPlayer::shared(config.nick.clone(), config.server);
             engine
                 .install_bindings(bot_state.clone())
                 .map_err(|e| anyhow!("installing bot bindings: {e}"))?;

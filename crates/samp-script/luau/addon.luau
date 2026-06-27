@@ -11,13 +11,13 @@ function sendSpawnRequest()
 end
 
 function sendDialogResponse(id, button, list, input)
-	print("send dialog response:", id, button, list, input)
+	local enc = utf8ToCp1251(input)
 	local bs = bitStream.new()
 	bs:writeUInt16(id)
 	bs:writeUInt8(button)
 	bs:writeUInt16(list)
-	bs:writeUInt8(input:len())
-	bs:writeString(input)
+	bs:writeUInt8(#enc)
+	bs:writeString(enc)
 	bs:sendRPC(62)
 end
 
@@ -61,26 +61,28 @@ end
 
 function sendInput(text)
 	assert(type(text) == "string", "string expected, got "..type(text))
+	local enc = utf8ToCp1251(text)
 	local bs = bitStream.new()
 	if text:sub(1, 1) == "/" then
-		bs:writeUInt32(text:len())
-		bs:writeString(text)
+		bs:writeUInt32(#enc)
+		bs:writeString(enc)
 		bs:sendRPC(50)
 	else
-		bs:writeUInt8(text:len())
-		bs:writeString(text)
+		bs:writeUInt8(#enc)
+		bs:writeString(enc)
 		bs:sendRPC(101)
 	end
 end
 
 function bitStream:readString8()
-	return self:readString(self:readUInt8())
+	return cp1251ToUtf8(self:readString(self:readUInt8()))
 end
 
 function bitStream:writeString8(v)
 	assert(type(v) == "string", "string expected, got "..type(v))
-	self:writeUInt8(len(v))
-	self:writeString(v)
+	local enc = utf8ToCp1251(v)
+	self:writeUInt8(#enc)
+	self:writeString(enc)
 end
 
 function bitStream:readBool8()

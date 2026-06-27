@@ -19,6 +19,7 @@ use samp_proto::{ClassId, PlayerId};
 use thiserror::Error;
 
 mod aim;
+mod client_emulation;
 mod codec;
 mod driver;
 mod registry;
@@ -27,7 +28,9 @@ mod transport;
 
 pub use registry::{Action, PacketRegistry};
 pub use samp_proto::{Direction, OutboundMsg, Outbox, Verdict};
-pub use state::{BotState, SharedBotState};
+pub use state::{
+    AimData, InVehicleData, LocalPlayer, OnFootData, SharedLocalPlayer, WeaponInventory,
+};
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
@@ -49,18 +52,12 @@ pub struct ClientConfig {
     /// RakNet connection password (the server-level password sent in `CONNECTION_REQUEST`). `None`
     /// for open servers like Arizona — this is *not* the account login password.
     pub password: Option<String>,
-    /// Account login password, typed into the server's login `ShowDialog`. Distinct from the RakNet
-    /// `password`. `None` ⇒ answer dialogs with an empty input.
-    pub account_password: Option<String>,
     pub client_version: String,
     pub default_class: ClassId,
     /// gpci/auth token; `None` ⇒ generate a best-effort one.
     pub gpci: Option<String>,
     pub sync_interval: Duration,
     pub reconnect_delay: Duration,
-    /// Send native aim-sync packets (a believable, rate-limited camera/aim) while spawned. Default
-    /// `true`; set `false` to send no aim sync.
-    pub aim_sync: bool,
 }
 
 impl ClientConfig {
@@ -70,13 +67,11 @@ impl ClientConfig {
                 server,
                 nick: nick.into(),
                 password: None,
-                account_password: None,
                 client_version: "0.3.7-R3".to_string(),
                 default_class: ClassId::default(),
                 gpci: None,
                 sync_interval: Duration::from_millis(100),
                 reconnect_delay: Duration::from_secs(5),
-                aim_sync: true,
             },
         }
     }
@@ -90,12 +85,6 @@ pub struct ClientConfigBuilder {
 impl ClientConfigBuilder {
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.config.password = Some(password.into());
-        self
-    }
-    /// Account login password typed into the server's login dialog (distinct from the RakNet
-    /// connection [`Self::password`]).
-    pub fn account_password(mut self, password: impl Into<String>) -> Self {
-        self.config.account_password = Some(password.into());
         self
     }
     pub fn client_version(mut self, version: impl Into<String>) -> Self {
@@ -188,7 +177,7 @@ impl Client {
     pub async fn connect_with_registry(
         config: ClientConfig,
         registry: PacketRegistry,
-        bot_state: SharedBotState,
+        bot_state: SharedLocalPlayer,
     ) -> Result<Self> {
         let rak_config = raknet::RakConfig {
             password: config.password.clone(),

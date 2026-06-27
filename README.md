@@ -28,7 +28,7 @@ MoonLoader / SAMP.Lua API, so stock scripts can hook every RPC and packet.
 ## Run
 
 ```sh
-cargo run -p app -- --server <host:port> --nick <Nick> [--account-password <pw>] [--scripts-dir example_scripts]
+cargo run -p app -- --server <host:port> --nick <Nick> [--scripts-dir example_scripts]
 ```
 
 `RUST_LOG=info` (or `raknet::transport=trace` to see every datagram as hex). The binary is

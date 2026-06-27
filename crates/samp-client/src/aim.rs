@@ -5,23 +5,29 @@
 //! and only while standing still) send a believable aim packet: a camera placed ~2 units behind the
 //! bot per its facing, jittered by a small random offset, looking back at the bot. When the server
 //! repositions the bot (`SetPlayerPos`/camera RPCs) the aim is regenerated and sent promptly.
+//!
+//! The aim it produces is the high-level [`AimData`]; the driver mirrors it into
+//! [`crate::state::LocalPlayer::aim`] and (with client emulation) tweaks it before [`AimSync::encode`]
+//! packs it into the wire [`AimSyncData`].
 
 use std::time::{Duration, Instant};
 
 use samp_proto::{AimSyncData, BitStreamWriter, Quaternion, SyncPacketId, Vector3};
 
-/// `camExtZoom = 63` (max, 6 bits) with `weaponState = 0` (high 2 bits) — matches the reference.
-const CAM_EXT_ZOOM_WEAPON_STATE: u8 = 63;
+use crate::state::AimData;
+
+/// `camExtZoom = 63` (max, 6 bits) — matches the reference.
+const CAM_EXT_ZOOM: u8 = 63;
 const ASPECT_RATIO: u8 = 85;
 const AIM_MIN_SECS: u64 = 5;
 const AIM_MAX_SECS: u64 = 60;
 
 /// Aim-sync state machine. Construct with [`AimSync::new`], feed it position updates and server
-/// repositions, and poll [`AimSync::due_packet`] each sync tick for a packet to send.
+/// repositions, then each sync tick poll [`AimSync::due`] and, when due, [`AimSync::encode`].
 pub(crate) struct AimSync {
     rng: u64,
     last_pos: Vector3,
-    aim: AimSyncData,
+    aim: AimData,
     next_at: Option<Instant>,
     is_regular_pos: bool,
     cam_offset: Vector3,
@@ -33,7 +39,7 @@ impl AimSync {
         Self {
             rng: seed | 1,
             last_pos: Vector3::default(),
-            aim: AimSyncData::default(),
+            aim: AimData::default(),
             next_at: None,
             is_regular_pos: false,
             cam_offset: Vector3::default(),
@@ -71,26 +77,50 @@ impl AimSync {
         self.next_at = Some(Instant::now() - Duration::from_secs(1)); // due now
     }
 
-    /// If an aim send is due (and the bot is not moving), return the packet body (`[203][AimSync]`)
-    /// and reschedule. Moving consumes the move flag and skips this cycle.
-    pub(crate) fn due_packet(&mut self, now: Instant) -> Option<Vec<u8>> {
+    /// Whether an aim send is due (and the bot is not moving), rescheduling the next send. Moving
+    /// consumes the move flag and skips this cycle. When this returns `true`, mutate [`Self::aim_mut`]
+    /// if desired and then call [`Self::encode`].
+    pub(crate) fn due(&mut self, now: Instant) -> bool {
         if self.bot_moved {
             self.bot_moved = false;
-            return None;
+            return false;
         }
         match self.next_at {
             Some(at) if at <= now => {
                 self.schedule(now);
-                let mut w = BitStreamWriter::new();
-                self.aim.encode(&mut w);
-                let body = w.into_bytes();
-                let mut packet = Vec::with_capacity(body.len() + 1);
-                packet.push(SyncPacketId::AimSync as u8);
-                packet.extend_from_slice(&body);
-                Some(packet)
+                true
             }
-            _ => None,
+            _ => false,
         }
+    }
+
+    /// The current aim (the high-level view the driver mirrors into `LocalPlayer`).
+    pub(crate) fn aim(&self) -> &AimData {
+        &self.aim
+    }
+
+    /// Mutable access for last-moment tweaks (client emulation adjusts camera z / weapon state here).
+    pub(crate) fn aim_mut(&mut self) -> &mut AimData {
+        &mut self.aim
+    }
+
+    /// Encode the current aim into the wire packet (`[203][AimSyncData]`).
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let wire = AimSyncData {
+            cam_mode: self.aim.cam_mode,
+            cam_front: self.aim.cam_front,
+            cam_pos: self.aim.cam_pos,
+            aim_z: 0.0,
+            cam_ext_zoom_weapon_state: (self.aim.ext_zoom & 0x3F) | (self.aim.weapon_state << 6),
+            aspect_ratio: ASPECT_RATIO,
+        };
+        let mut w = BitStreamWriter::new();
+        wire.encode(&mut w);
+        let body = w.into_bytes();
+        let mut packet = Vec::with_capacity(body.len() + 1);
+        packet.push(SyncPacketId::AimSync as u8);
+        packet.extend_from_slice(&body);
+        packet
     }
 
     /// Reset on disconnect.
@@ -128,13 +158,12 @@ impl AimSync {
                 z: pos.z - cam.z + jitter.z,
             })
         };
-        self.aim = AimSyncData {
+        self.aim = AimData {
             cam_mode: if in_vehicle { 18 } else { 4 },
-            cam_front,
             cam_pos: cam,
-            aim_z: 0.0,
-            cam_ext_zoom_weapon_state: CAM_EXT_ZOOM_WEAPON_STATE,
-            aspect_ratio: ASPECT_RATIO,
+            cam_front,
+            ext_zoom: CAM_EXT_ZOOM,
+            weapon_state: 0,
         };
     }
 
@@ -199,14 +228,15 @@ mod tests {
         let t0 = Instant::now();
         aim.arm(t0, Vector3::default(), Quaternion::default(), false);
         // Not due yet (scheduled 5–60s out).
-        assert!(aim.due_packet(t0).is_none());
+        assert!(!aim.due(t0));
         // Far in the future → due. Packet is [203] + 31-byte AimSyncData.
         let later = t0 + Duration::from_secs(120);
-        let packet = aim.due_packet(later).expect("aim due");
+        assert!(aim.due(later));
+        let packet = aim.encode();
         assert_eq!(packet[0], SyncPacketId::AimSync as u8);
         assert_eq!(packet.len(), 1 + 31);
         // Immediately after, not due again.
-        assert!(aim.due_packet(later).is_none());
+        assert!(!aim.due(later));
     }
 
     #[test]
@@ -220,9 +250,9 @@ mod tests {
             z: 0.0,
         }); // moved
         let later = t0 + Duration::from_secs(120);
-        assert!(aim.due_packet(later).is_none(), "suppressed while moving");
+        assert!(!aim.due(later), "suppressed while moving");
         // Next cycle, standing still → sends.
-        assert!(aim.due_packet(later).is_some());
+        assert!(aim.due(later));
     }
 
     #[test]
@@ -239,6 +269,20 @@ mod tests {
             Quaternion::default(),
             false,
         );
-        assert!(aim.due_packet(t0).is_some(), "due right after reposition");
+        assert!(aim.due(t0), "due right after reposition");
+    }
+
+    #[test]
+    fn cam_mode_reflects_vehicle_and_ext_zoom_packs() {
+        let mut aim = AimSync::new(3);
+        let t0 = Instant::now();
+        aim.arm(t0, Vector3::default(), Quaternion::default(), true);
+        assert_eq!(aim.aim().cam_mode, 18); // in vehicle
+        assert_eq!(aim.aim().ext_zoom, CAM_EXT_ZOOM);
+        // weapon_state in the high 2 bits, ext_zoom in the low 6. AimSyncData body layout:
+        // cam_mode(1) cam_front(12) cam_pos(12) aim_z(4) cam_ext_zoom_weapon_state(1) aspect_ratio(1).
+        aim.aim_mut().weapon_state = 2;
+        let packet = aim.encode();
+        assert_eq!(packet[1 + 29], CAM_EXT_ZOOM | (2 << 6));
     }
 }

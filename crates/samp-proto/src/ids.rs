@@ -54,6 +54,8 @@ impl TryFrom<u8> for RpcId {
 pub enum SyncPacketId {
     VehicleSync = 200,
     AimSync = 203,
+    /// Client→server weapon inventory snapshot (`PACKET_WEAPONS_UPDATE`).
+    WeaponsUpdate = 204,
     BulletSync = 206,
     PlayerSync = 207,
     MarkersSync = 208,
@@ -75,6 +77,7 @@ impl TryFrom<u8> for SyncPacketId {
         Ok(match value {
             200 => SyncPacketId::VehicleSync,
             203 => SyncPacketId::AimSync,
+            204 => SyncPacketId::WeaponsUpdate,
             206 => SyncPacketId::BulletSync,
             207 => SyncPacketId::PlayerSync,
             208 => SyncPacketId::MarkersSync,

@@ -17,8 +17,7 @@ mod require;
 use samp_proto::{OutboundMsg, Outbox, Verdict};
 
 /// Outgoing chat lines a script queued via `sampSendChat`, buffered until the host drains them.
-/// Bytes are in the server's encoding (the script handles cp1251 on Cyrillic servers; ASCII passes
-/// through).
+/// Already encoded to the wire encoding (cp1251): scripts pass UTF-8 and the host transcodes.
 type OutgoingChat = Rc<RefCell<Vec<Vec<u8>>>>;
 
 /// Owns a luau VM and the scripts loaded into it.
@@ -35,6 +34,7 @@ impl ScriptEngine {
     pub fn new() -> mlua::Result<Self> {
         let lua = Lua::new();
         install_print(&lua)?;
+        install_text_codec(&lua)?;
         let outgoing_chat: OutgoingChat = Rc::new(RefCell::new(Vec::new()));
         install_send_chat(&lua, outgoing_chat.clone())?;
         lua.globals().set("sampev", lua.create_table()?)?;
@@ -123,7 +123,7 @@ impl ScriptEngine {
     /// queue raw sends the driver will flush. Use the registry's [`samp_proto::Outbox`].
     /// Install the bot getters/setters (`getBot*`/`setBot*`, `getServerAddress`, `updateSync`,
     /// `reconnect`) bound to the shared bot state the driver mirrors.
-    pub fn install_bindings(&self, state: samp_client::SharedBotState) -> mlua::Result<()> {
+    pub fn install_bindings(&self, state: samp_client::SharedLocalPlayer) -> mlua::Result<()> {
         bindings::install_bindings(&self.lua, state)
     }
 
@@ -158,8 +158,8 @@ impl ScriptEngine {
         let dialogs = outbox;
         let send_dialog = self.lua.create_function(
             move |_, (id, button, list_item, input): (u16, u8, u16, mlua::String)| {
-                let payload =
-                    samp_proto::encode_dialog_response(id, button, list_item, &input.as_bytes());
+                let input = samp_proto::encode_cp1251(&input.to_string_lossy());
+                let payload = samp_proto::encode_dialog_response(id, button, list_item, &input);
                 dialogs
                     .borrow_mut()
                     .push_back(OutboundMsg::Rpc { id: 62, payload });
@@ -237,6 +237,20 @@ fn install_print(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set("print", print)
 }
 
+/// Install the cp1251↔UTF-8 helpers (`cp1251ToUtf8`, `utf8ToCp1251`). The high-level `samp.events`
+/// string fields and chat/dialog senders use these so scripts always see and send UTF-8; they are
+/// also exposed for scripts doing raw bitstream text by hand.
+fn install_text_codec(lua: &Lua) -> mlua::Result<()> {
+    let to_utf8 = lua.create_function(|lua, bytes: mlua::String| {
+        lua.create_string(samp_proto::decode_cp1251(&bytes.as_bytes()))
+    })?;
+    lua.globals().set("cp1251ToUtf8", to_utf8)?;
+    let to_cp1251 = lua.create_function(|lua, text: mlua::String| {
+        lua.create_string(samp_proto::encode_cp1251(&text.to_string_lossy()))
+    })?;
+    lua.globals().set("utf8ToCp1251", to_cp1251)
+}
+
 /// `registerHandler(name, fn)` — append `fn` to the chokepoint named `name` (e.g. `"onSendRPC"`).
 /// Handlers are stored in the `__rakHandlers` table and run by [`ScriptEngine::dispatch_chokepoint`].
 fn install_register_handler(lua: &Lua) -> mlua::Result<()> {
@@ -259,7 +273,10 @@ fn install_register_handler(lua: &Lua) -> mlua::Result<()> {
 /// `sampSendChat(text)` — queue a chat line for the host to send (raw bytes, server encoding).
 fn install_send_chat(lua: &Lua, outgoing: OutgoingChat) -> mlua::Result<()> {
     let send_chat = lua.create_function(move |_, text: mlua::String| {
-        outgoing.borrow_mut().push(text.as_bytes().to_vec());
+        // Scripts speak UTF-8; the wire is cp1251.
+        outgoing
+            .borrow_mut()
+            .push(samp_proto::encode_cp1251(&text.to_string_lossy()));
         Ok(())
     })?;
     lua.globals().set("sampSendChat", send_chat)

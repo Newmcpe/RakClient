@@ -19,6 +19,33 @@ fn packet_data(msg: &OutboundMsg) -> &[u8] {
 }
 
 #[test]
+fn text_codec_translates_cyrillic_both_ways() {
+    let engine = ScriptEngine::new().expect("vm");
+    // "Привет" → cp1251 bytes, and back to the same UTF-8.
+    let cp: mlua::String = engine.eval("return utf8ToCp1251('Привет')").unwrap();
+    assert_eq!(
+        cp.as_bytes().to_vec(),
+        vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]
+    );
+    let utf8: String = engine
+        .eval("return cp1251ToUtf8(utf8ToCp1251('Привет'))")
+        .unwrap();
+    assert_eq!(utf8, "Привет");
+}
+
+#[test]
+fn send_chat_encodes_utf8_to_cp1251() {
+    let engine = ScriptEngine::new().expect("vm");
+    engine
+        .load_script("sampSendChat('Привет')", "c")
+        .expect("load");
+    assert_eq!(
+        engine.drain_outgoing_chat(),
+        vec![vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]]
+    );
+}
+
+#[test]
 fn lifecycle_fires_and_queues_packet() {
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -138,7 +165,7 @@ fn assert_arizona_launcher(rel_path: &str) {
     let outbox: Outbox = Rc::new(RefCell::new(VecDeque::new()));
     engine.install_sender(outbox.clone()).expect("sender");
     engine
-        .install_bindings(samp_client::BotState::shared(
+        .install_bindings(samp_client::LocalPlayer::shared(
             "Bot".to_string(),
             "127.0.0.1:7777".parse().expect("addr"),
         ))
@@ -165,6 +192,53 @@ fn assert_arizona_launcher(rel_path: &str) {
     }
     let queued = outbox.borrow().len();
     assert!(queued >= 2, "expected 2 CEF packets queued, got {queued}");
+}
+
+#[test]
+fn arizona_login_answers_auth_dialog() {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../example_scripts/arizona_login.luau");
+    let source = std::fs::read_to_string(&path).expect("read arizona_login.luau");
+
+    let engine = ScriptEngine::new().expect("vm");
+    let outbox: Outbox = Rc::new(RefCell::new(VecDeque::new()));
+    engine.install_sender(outbox.clone()).expect("sender");
+    engine.load_script(&source, "arizona_login").expect("load");
+
+    // The host hands scripts UTF-8 titles → the login dialog is answered with a DialogResponse (62).
+    engine
+        .load_script(
+            "require('samp.events').onShowDialog(7, 3, 'Авторизация', '', '', '')",
+            "auth",
+        )
+        .expect("auth dialog");
+    let msgs: Vec<_> = outbox.borrow_mut().drain(..).collect();
+    assert_eq!(msgs.len(), 1, "login dialog should be answered");
+    match &msgs[0] {
+        OutboundMsg::Rpc { id, payload } => {
+            assert_eq!(*id, 62, "RPC_DialogResponse");
+            assert_eq!(&payload[0..2], &[7, 0], "echoes dialog id");
+            assert_eq!(payload[2], 1, "confirm button");
+            assert!(payload.ends_with(b"CHANGE_ME"), "sends the password");
+        }
+        other => panic!("expected an RPC, got {other:?}"),
+    }
+
+    // A different dialog is left alone.
+    engine
+        .load_script(
+            "require('samp.events').onShowDialog(8, 0, 'Info', 'Ok', '', '')",
+            "other",
+        )
+        .expect("other dialog");
+    assert!(
+        outbox.borrow().is_empty(),
+        "non-login dialogs are not answered"
+    );
 }
 
 #[test]
@@ -206,7 +280,7 @@ fn samp_events_rewrites_client_join() {
 #[test]
 fn bot_bindings_read_write_state() {
     let engine = ScriptEngine::new().expect("vm");
-    let state = samp_client::BotState::shared(
+    let state = samp_client::LocalPlayer::shared(
         "Tester".to_string(),
         "127.0.0.1:7777".parse().expect("addr"),
     );
@@ -222,8 +296,8 @@ fn bot_bindings_read_write_state() {
     engine
         .load_script("setBotPosition(1.5, 2.5, 3.5)", "p")
         .expect("load");
-    assert_eq!(state.borrow().position.x, 1.5);
-    assert_eq!(state.borrow().position.z, 3.5);
+    assert_eq!(state.borrow().on_foot.position.x, 1.5);
+    assert_eq!(state.borrow().on_foot.position.z, 3.5);
     engine.load_script("updateSync()", "u").expect("load");
     assert!(state.borrow().force_sync);
 }

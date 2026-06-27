@@ -140,7 +140,6 @@ impl UserData for BitStreamUserData {
             lua.create_string(&bytes)
         });
 
-        // --- cursors / state ---
         methods.add_method("setReadOffset", |_, this, bits: usize| {
             this.bs.borrow_mut().set_read_offset(bits);
             Ok(())
@@ -166,7 +165,6 @@ impl UserData for BitStreamUserData {
             Ok(())
         });
 
-        // --- senders ---
         methods.add_method("sendPacket", |_, this, ()| {
             this.outbox.borrow_mut().push_back(OutboundMsg::Packet {
                 data: this.bytes(),

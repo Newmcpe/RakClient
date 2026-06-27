@@ -14,6 +14,7 @@ const MODULES: &[(&str, &str)] = &[
     ("sampfuncs", include_str!("../luau/sampfuncs.luau")),
     ("vector3d", include_str!("../luau/vector3d.luau")),
     ("addon", include_str!("../luau/addon.luau")),
+    ("packet", include_str!("../luau/packet.luau")),
     ("arizona", include_str!("../luau/arizona.luau")),
     ("samp.raknet", include_str!("../luau/samp/raknet.luau")),
     ("samp.events", include_str!("../luau/samp/events.luau")),

@@ -18,9 +18,10 @@ use samp_proto::{
 use tokio::time::{self, Interval, MissedTickBehavior, Sleep};
 
 use crate::aim::AimSync;
+use crate::client_emulation::ClientEmulation;
 use crate::codec::Codec;
 use crate::registry::PacketRegistry;
-use crate::state::SharedBotState;
+use crate::state::SharedLocalPlayer;
 use crate::transport::Transport;
 use crate::{ClientConfig, ClientEvent, ConnectionState};
 
@@ -33,7 +34,6 @@ const RPC_REQUEST_SPAWN: u8 = RpcId::RequestSpawn as u8;
 const RPC_CONNECTION_REJECTED: u8 = RpcId::ConnectionRejected as u8;
 const RPC_CLIENT_MESSAGE: u8 = RpcId::ClientMessage as u8;
 const RPC_CHAT: u8 = RpcId::Chat as u8;
-const RPC_SHOW_DIALOG: u8 = RpcId::ShowDialog as u8;
 
 const SPAWN_HEALTH: u8 = 100;
 
@@ -60,23 +60,25 @@ pub(crate) struct Driver<T: Transport, C: Codec> {
     registry: PacketRegistry,
     /// Fires the registry's `on_update` handlers; armed only when handlers are registered.
     update_timer: Option<Interval>,
-    /// Shared bot state mirrored to/from `sync`, exposing `getBot*`/`setBot*` to scripts.
-    bot_state: Option<SharedBotState>,
-    /// Native aim-sync emulation; `None` when disabled via config.
-    aim: Option<AimSync>,
+    /// Shared local-player state mirrored to/from `sync`, exposing `getBot*`/`setBot*` to scripts.
+    bot_state: Option<SharedLocalPlayer>,
+    /// Native aim-sync emulation (always on — standard client behaviour).
+    aim: AimSync,
+    /// Standard-client emulation: ClientCheck answers, weapon inventory, score-ping, vehicle
+    /// ownership (always on; acts once a shared bot state is attached).
+    emulation: ClientEmulation,
 }
 
 impl<T: Transport, C: Codec> Driver<T, C> {
     pub(crate) fn new(config: ClientConfig, transport: T, codec: C) -> Self {
         let mut pending = VecDeque::new();
         pending.push_back(ClientEvent::StateChanged(ConnectionState::Connecting));
-        let aim = config.aim_sync.then(|| {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x1234_5678);
-            AimSync::new(seed)
-        });
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x1234_5678);
+        let aim = AimSync::new(seed);
+        let emulation = ClientEmulation::new(seed ^ 0x5555_5555_5555_5555, Instant::now());
         Self {
             config,
             transport,
@@ -92,12 +94,13 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             update_timer: None,
             bot_state: None,
             aim,
+            emulation,
         }
     }
 
-    /// Share a [`SharedBotState`] with the script engine: the driver mirrors `sync` into it and reads
-    /// `setBot*` writes back out of it.
-    pub(crate) fn with_bot_state(mut self, state: SharedBotState) -> Self {
+    /// Share a [`SharedLocalPlayer`] with the script engine: the driver mirrors `sync` into it and
+    /// reads `setBot*` writes back out of it.
+    pub(crate) fn with_bot_state(mut self, state: SharedLocalPlayer) -> Self {
         self.bot_state = Some(state);
         self
     }
@@ -185,16 +188,16 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         }
     }
 
-    /// Push the authoritative `sync` fields into the shared bot state (so `getBot*` reflects what the
-    /// server set, e.g. the spawn position).
+    /// Push the authoritative `sync` fields into the shared local-player state (so `getBot*` reflects
+    /// what the server set, e.g. the spawn position).
     fn mirror_to_state(&self) {
         if let Some(state) = &self.bot_state {
             let mut s = state.borrow_mut();
-            s.position = self.sync.position;
-            s.rotation = self.sync.quaternion;
-            s.health = self.sync.health;
-            s.armour = self.sync.armour;
-            s.weapon = self.sync.weapon.0;
+            s.on_foot.position = self.sync.position;
+            s.on_foot.quaternion = self.sync.quaternion;
+            s.on_foot.health = self.sync.health;
+            s.on_foot.armour = self.sync.armour;
+            s.on_foot.weapon = self.sync.weapon.0;
         }
     }
 
@@ -202,11 +205,19 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     fn mirror_from_state(&mut self) {
         if let Some(state) = &self.bot_state {
             let s = state.borrow();
-            self.sync.position = s.position;
-            self.sync.quaternion = s.rotation;
-            self.sync.health = s.health;
-            self.sync.armour = s.armour;
-            self.sync.weapon = WeaponId(s.weapon);
+            self.sync.position = s.on_foot.position;
+            self.sync.quaternion = s.on_foot.quaternion;
+            self.sync.health = s.on_foot.health;
+            self.sync.armour = s.on_foot.armour;
+            self.sync.weapon = WeaponId(s.on_foot.weapon);
+        }
+    }
+
+    /// Mirror the native aim state into the shared local-player model so `LocalPlayer.aim` reflects
+    /// the camera the client is about to report.
+    fn mirror_aim_to_state(&self) {
+        if let Some(state) = self.bot_state.as_ref() {
+            state.borrow_mut().aim = *self.aim.aim();
         }
     }
 
@@ -316,6 +327,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         };
         self.track_state(id, payload);
         self.aim_follow(id, payload);
+        self.emulation_incoming(id, payload).await;
         match (id, &self.state) {
             (RPC_INIT_GAME, ConnectionState::Joining) => self.on_init_game(payload).await,
             (RPC_REQUEST_CLASS, ConnectionState::ClassSelection) => {
@@ -327,14 +339,14 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             (RPC_CONNECTION_REJECTED, _) => self.on_disconnect(DisconnectReason::Rejected),
             (RPC_CLIENT_MESSAGE, _) => self.on_client_message(payload),
             (RPC_CHAT, _) => self.on_player_chat(payload),
-            (RPC_SHOW_DIALOG, _) => self.on_show_dialog(payload).await,
             _ => {}
         }
     }
 
-    /// Update the shared bot state from money/interior/vehicle/camera RPCs so `getBotMoney` etc.
-    /// return live values. Decodes via the typed registry; unknown ids are ignored.
+    /// Update the shared local-player state from money/interior/vehicle/camera RPCs so `getBotMoney`
+    /// etc. return live values. Decodes via the typed registry; unknown ids are ignored.
     fn track_state(&mut self, id: u8, payload: &[u8]) {
+        use crate::state::InVehicleData;
         use samp_proto::events::FieldValue as F;
         let Some(state) = &self.bot_state else {
             return;
@@ -358,10 +370,14 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             }
             70 => {
                 if let Some(F::U16(vehicle)) = values.first() {
-                    s.vehicle = *vehicle; // PutPlayerInVehicle
+                    // PutPlayerInVehicle
+                    s.vehicle = Some(InVehicleData {
+                        id: *vehicle,
+                        ..InVehicleData::default()
+                    });
                 }
             }
-            71 => s.vehicle = 0, // RemovePlayerFromVehicle
+            71 => s.vehicle = None, // RemovePlayerFromVehicle
             157 => {
                 if let Some(F::Vec3(pos)) = values.first() {
                     s.camera_pos = *pos; // SetCameraPosition
@@ -374,9 +390,6 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     /// Follow server repositions for aim-sync: `SetPlayerPos` while spawned, and the camera RPCs
     /// before spawn, move the bot and regenerate the aim (ported from `aim_fix_updated.lua`).
     fn aim_follow(&mut self, id: u8, payload: &[u8]) {
-        if self.aim.is_none() {
-            return;
-        }
         let spawned = matches!(self.state, ConnectionState::Spawned);
         let new_pos = match id {
             12 | 13 if spawned => decode_first_vec3(id, payload),
@@ -390,44 +403,67 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         self.sync.position = new_pos;
         self.mirror_to_state();
         let in_vehicle = self.in_vehicle();
-        if let Some(aim) = self.aim.as_mut() {
-            aim.on_reposition(new_pos, self.sync.quaternion, in_vehicle);
+        self.aim
+            .on_reposition(new_pos, self.sync.quaternion, in_vehicle);
+    }
+
+    /// Run standard-client emulation over an incoming RPC and send anything it produces.
+    async fn emulation_incoming(&mut self, id: u8, payload: &[u8]) {
+        let Some(state) = self.bot_state.as_ref() else {
+            return;
+        };
+        let msgs = self
+            .emulation
+            .on_incoming_rpc(&mut state.borrow_mut(), id, payload);
+        self.send_outbound(msgs).await;
+    }
+
+    /// Send emulation-produced packets/RPCs. These are the client's own, so they bypass the script
+    /// chokepoints.
+    async fn send_outbound(&mut self, msgs: Vec<OutboundMsg>) {
+        for msg in msgs {
+            let result = match msg {
+                OutboundMsg::Packet {
+                    data,
+                    reliability,
+                    channel,
+                } => {
+                    self.transport
+                        .send(data, reliability_from_wire(reliability), channel)
+                        .await
+                }
+                OutboundMsg::Rpc { id, payload } => self.transport.rpc(id, payload).await,
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to send emulation message");
+                self.on_disconnect(DisconnectReason::ConnectionLost);
+                return;
+            }
         }
     }
 
     /// An incoming raw packet (`data[0]` = id). The client does not process incoming packets itself;
-    /// the `onReceivePacket` chokepoint lets scripts observe (or, for the game, drop) them.
+    /// the `onReceivePacket` chokepoint lets scripts observe (or, for the game, drop) them. With
+    /// emulation on, a `VehicleSync` that targets the bot's own vehicle is treated as a hijack: the
+    /// bot drops the vehicle and the packet.
     fn on_packet(&mut self, data: &[u8]) {
         let Some(&id) = data.first() else {
             return;
         };
-        let _ = self.registry.dispatch_packet(Direction::Incoming, id, data);
-    }
-
-    /// Driver-side auto-login fallback for a server `ShowDialog`. Only fires when an
-    /// `account_password` is explicitly configured; otherwise the dialog is left for a Lua
-    /// `samp.events.onShowDialog` handler (which answers via `sampSendDialogResponse`). Arizona
-    /// gates a valid session behind its login dialog; the password is never logged.
-    async fn on_show_dialog(&mut self, payload: &[u8]) {
-        let Some(input) = self.config.account_password.clone() else {
-            return; // no password set → let a script answer (or no auth needed).
-        };
-        let dialog = match samp_proto::decode_show_dialog(payload) {
-            Ok(dialog) => dialog,
-            Err(error) => {
-                tracing::warn!(%error, "failed to decode show dialog");
+        if id == SyncPacketId::VehicleSync as u8 {
+            let hijack = self
+                .bot_state
+                .as_ref()
+                .is_some_and(|state| self.emulation.is_vehicle_hijack(&state.borrow(), data));
+            if hijack {
+                if let Some(state) = self.bot_state.as_ref() {
+                    state.borrow_mut().vehicle = None;
+                }
+                tracing::info!("emulation: refused a vehicle-sync hijack of our vehicle");
                 return;
             }
-        };
-        tracing::info!(
-            dialog_id = dialog.dialog_id,
-            style = dialog.style,
-            title = %samp_proto::decode_cp1251(&dialog.title),
-            "answering server dialog"
-        );
-        let response =
-            samp_proto::encode_dialog_response(dialog.dialog_id, 1, 0xFFFF, input.as_bytes());
-        self.send_rpc(RpcId::DialogResponse as u8, response).await;
+        }
+        let _ = self.registry.dispatch_packet(Direction::Incoming, id, data);
     }
 
     fn on_client_message(&mut self, payload: &[u8]) {
@@ -526,26 +562,32 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         self.transition(ConnectionState::Spawned);
         self.mirror_to_state();
         let in_vehicle = self.in_vehicle();
-        if let Some(aim) = self.aim.as_mut() {
-            aim.arm(
-                Instant::now(),
-                self.sync.position,
-                self.sync.quaternion,
-                in_vehicle,
-            );
-        }
+        self.aim.arm(
+            Instant::now(),
+            self.sync.position,
+            self.sync.quaternion,
+            in_vehicle,
+        );
         self.pending.push_back(ClientEvent::Spawned);
     }
 
-    /// Whether the bot is currently in a vehicle (from the shared bot state).
+    /// Whether the bot is currently in a vehicle (from the shared local-player state).
     fn in_vehicle(&self) -> bool {
         self.bot_state
             .as_ref()
-            .is_some_and(|s| s.borrow().vehicle != 0)
+            .is_some_and(|s| s.borrow().in_vehicle())
     }
 
     async fn on_sync_tick(&mut self) {
         self.mirror_from_state();
+        // Emulation: report the held weapon and the occasional score-ping key blip.
+        if let Some(state) = self.bot_state.as_ref() {
+            let (weapon, keys) =
+                self.emulation
+                    .adjust_on_foot(&state.borrow(), self.sync.keys, Instant::now());
+            self.sync.weapon = WeaponId(weapon);
+            self.sync.keys = keys;
+        }
         let body = self.codec.encode_on_foot_sync(&self.sync);
         let mut packet = Vec::with_capacity(body.len() + 1);
         packet.push(SyncPacketId::PlayerSync as u8);
@@ -569,14 +611,28 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             self.on_disconnect(DisconnectReason::ConnectionLost);
             return;
         }
-        // Native aim-sync: note position (to detect movement) and send a believable aim when due.
-        let aim_packet = match self.aim.as_mut() {
-            Some(aim) => {
-                aim.on_position(self.sync.position);
-                aim.due_packet(Instant::now())
-            }
-            None => None,
+        // Emulation: stream the weapon inventory periodically.
+        let weapons_msg = if let Some(state) = self.bot_state.as_ref() {
+            self.emulation
+                .due_weapons_update(&state.borrow(), Instant::now())
+        } else {
+            None
         };
+        if let Some(msg) = weapons_msg {
+            self.send_outbound(vec![msg]).await;
+        }
+        // Native aim-sync: note position (to detect movement) and send a believable aim when due.
+        self.aim.on_position(self.sync.position);
+        let aim_packet = if self.aim.due(Instant::now()) {
+            if let Some(state) = self.bot_state.as_ref() {
+                self.emulation
+                    .spoof_aim(self.aim.aim_mut(), &state.borrow());
+            }
+            Some(self.aim.encode())
+        } else {
+            None
+        };
+        self.mirror_aim_to_state();
         if let Some(aim_packet) = aim_packet {
             if let Err(error) = self
                 .transport
@@ -613,8 +669,9 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     fn on_disconnect(&mut self, reason: DisconnectReason) {
-        if let Some(aim) = self.aim.as_mut() {
-            aim.reset();
+        self.aim.reset();
+        if let Some(state) = self.bot_state.as_ref() {
+            self.emulation.reset(&mut state.borrow_mut());
         }
         self.transition(ConnectionState::Disconnected);
         self.pending
@@ -1048,7 +1105,7 @@ mod tests {
     fn track_state_updates_money_and_vehicle() {
         let (transport, _log) = ScriptedTransport::new(Vec::new(), false);
         let state =
-            crate::state::BotState::shared("Bot".to_string(), "127.0.0.1:7777".parse().unwrap());
+            crate::state::LocalPlayer::shared("Bot".to_string(), "127.0.0.1:7777".parse().unwrap());
         let mut driver = Driver::new(test_config(), transport, FakeCodec::default())
             .with_bot_state(state.clone());
 
@@ -1061,9 +1118,9 @@ mod tests {
 
         // PutPlayerInVehicle (70): vehicleId u16 then seat u8.
         driver.track_state(70, &[0x2A, 0x00, 0x00]);
-        assert_eq!(state.borrow().vehicle, 42);
+        assert_eq!(state.borrow().vehicle_id(), 42);
         driver.track_state(71, &[]); // RemovePlayerFromVehicle
-        assert_eq!(state.borrow().vehicle, 0);
+        assert!(state.borrow().vehicle.is_none());
     }
 
     #[tokio::test(start_paused = true)]

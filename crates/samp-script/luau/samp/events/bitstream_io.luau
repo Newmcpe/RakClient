@@ -9,6 +9,10 @@ type BitStream = any
 local mod = {}
 local vector3d = require 'vector3d'
 
+-- Text fields are cp1251 on the wire but scripts work in UTF-8: read decodes, write encodes. The
+-- host installs `cp1251ToUtf8`/`utf8ToCp1251` (ASCII is identity, so non-text ASCII fields are
+-- unaffected).
+--
 -- ffi-free port: read/write the 'size' raw bytes via bitStream primitives.
 -- ffi.string() stops at the first NUL byte, so we mirror that here.
 local function bitstream_read_fixed_string(bs: BitStream, size: number): string
@@ -21,11 +25,11 @@ local function bitstream_read_fixed_string(bs: BitStream, size: number): string
 		if bytes[i] == 0 then break end
 		chars[i] = string.char(bytes[i])
 	end
-	return table.concat(chars)
+	return cp1251ToUtf8(table.concat(chars))
 end
 
 local function bitstream_write_fixed_string(bs: BitStream, str: string, size: number)
-	local sub = string.sub(str, 1, size)
+	local sub = string.sub(utf8ToCp1251(str), 1, size)
 	local sublen = #sub
 	for i = 1, size do
 		if i <= sublen then
@@ -38,11 +42,11 @@ end
 
 -- SA-MP Huffman-encoded string, via the host's bs:readEncoded/writeEncoded (samp_proto encoded.rs).
 local function bitstream_read_encoded(bs: BitStream, maxlen: number): string
-	return bs:readEncoded(maxlen)
+	return cp1251ToUtf8(bs:readEncoded(maxlen))
 end
 
 local function bitstream_write_encoded(bs: BitStream, value: string)
-	bs:writeEncoded(value)
+	bs:writeEncoded(utf8ToCp1251(value))
 end
 
 mod.bool = {
@@ -89,11 +93,12 @@ mod.string8 = {
 	read = function(bs: BitStream): string
 		local len =  bs:readUInt8()
 		if len <= 0 then return '' end
-		return bs:readString(len)
+		return cp1251ToUtf8(bs:readString(len))
 	end,
 	write = function(bs: BitStream, value: string)
-		bs:writeUInt8(#value)
-		bs:writeString(value)
+		local enc = utf8ToCp1251(value)
+		bs:writeUInt8(#enc)
+		bs:writeString(enc)
 	end
 }
 
@@ -101,11 +106,12 @@ mod.string16 = {
 	read = function(bs: BitStream): string
 		local len = bs:readUInt16()
 		if len <= 0 then return '' end
-		return bs:readString(len)
+		return cp1251ToUtf8(bs:readString(len))
 	end,
 	write = function(bs: BitStream, value: string)
-		bs:writeUInt16(#value)
-		bs:writeString(value)
+		local enc = utf8ToCp1251(value)
+		bs:writeUInt16(#enc)
+		bs:writeString(enc)
 	end
 }
 
@@ -113,11 +119,12 @@ mod.string32 = {
 	read = function(bs: BitStream): string
 		local len = bs:readUInt32()
 		if len <= 0 then return '' end
-		return bs:readString(len)
+		return cp1251ToUtf8(bs:readString(len))
 	end,
 	write = function(bs: BitStream, value: string)
-		bs:writeUInt32(#value)
-		bs:writeString(value)
+		local enc = utf8ToCp1251(value)
+		bs:writeUInt32(#enc)
+		bs:writeString(enc)
 	end
 }
 

@@ -20,6 +20,7 @@ mod fields;
 mod ids;
 mod rwbitstream;
 mod sync;
+mod weapon;
 
 pub use bitstream::{BitStreamReader, BitStreamWriter};
 pub use encoded::{decode_string, encode_string};
@@ -41,6 +42,7 @@ pub use codec::{
 pub use ids::{RpcId, SyncPacketId};
 #[doc(hidden)]
 pub use inventory;
+pub use weapon::{encode_weapons_update, weapon_slot, weapon_state, WeaponSlot, WEAPON_SLOTS};
 
 use thiserror::Error;
 
@@ -169,6 +171,29 @@ pub fn decode_cp1251(bytes: &[u8]) -> String {
             0x00..=0x7F => b as char,
             0x80..=0xBF => CP1251_HIGH[(b - 0x80) as usize],
             0xC0..=0xFF => char::from_u32(0x0410 + (b as u32 - 0xC0)).unwrap_or('\u{FFFD}'),
+        })
+        .collect()
+}
+
+/// Encode a UTF-8 string to Windows-1251 (cp1251) bytes — the inverse of [`decode_cp1251`]. ASCII
+/// passes through; `U+0410..=U+044F` map linearly to `0xC0..=0xFF`; other cp1251-representable
+/// characters are looked up in [`CP1251_HIGH`]; anything with no cp1251 mapping becomes `?`.
+///
+/// ```
+/// use samp_proto::encode_cp1251;
+/// assert_eq!(encode_cp1251("hi"), b"hi");
+/// assert_eq!(encode_cp1251("При"), vec![0xCF, 0xF0, 0xE8]);
+/// ```
+pub fn encode_cp1251(text: &str) -> Vec<u8> {
+    text.chars()
+        .map(|c| match c {
+            '\u{0}'..='\u{7F}' => c as u8,
+            'А'..='я' => (0xC0 + (c as u32 - 0x0410)) as u8,
+            _ => CP1251_HIGH
+                .iter()
+                .position(|&h| h == c)
+                .map(|i| 0x80 + i as u8)
+                .unwrap_or(b'?'),
         })
         .collect()
 }

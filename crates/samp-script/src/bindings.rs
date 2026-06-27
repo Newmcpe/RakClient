@@ -1,15 +1,15 @@
-//! RakSAMP native bot getters/setters, backed by the shared [`SharedBotState`] the driver mirrors.
+//! RakSAMP native bot getters/setters, backed by the shared [`SharedLocalPlayer`] the driver mirrors.
 //!
 //! State (position/rotation/nick/…) reads and writes go straight to the shared cell; `updateSync`
-//! and `reconnect` set flags the driver polls. Money/interior/vehicle/camera are placeholders until
-//! the relevant RPCs populate them (Phase 6).
+//! and `reconnect` set flags the driver polls. Money/interior/camera are populated from the relevant
+//! RPCs by the driver's `track_state`.
 
 use mlua::Lua;
-use samp_client::SharedBotState;
+use samp_client::{InVehicleData, SharedLocalPlayer};
 use samp_proto::Vector3;
 
 /// Install `getBot*`/`setBot*`, `getServerAddress`, `updateSync`, `reconnect` bound to `state`.
-pub fn install_bindings(lua: &Lua, state: SharedBotState) -> mlua::Result<()> {
+pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()> {
     let globals = lua.globals();
 
     let s = state.clone();
@@ -35,7 +35,7 @@ pub fn install_bindings(lua: &Lua, state: SharedBotState) -> mlua::Result<()> {
     globals.set(
         "getBotPosition",
         lua.create_function(move |_, ()| {
-            let p = s.borrow().position;
+            let p = s.borrow().on_foot.position;
             Ok((p.x, p.y, p.z))
         })?,
     )?;
@@ -43,7 +43,7 @@ pub fn install_bindings(lua: &Lua, state: SharedBotState) -> mlua::Result<()> {
     globals.set(
         "setBotPosition",
         lua.create_function(move |_, (x, y, z): (f32, f32, f32)| {
-            s.borrow_mut().position = Vector3 { x, y, z };
+            s.borrow_mut().on_foot.position = Vector3 { x, y, z };
             Ok(())
         })?,
     )?;
@@ -52,7 +52,7 @@ pub fn install_bindings(lua: &Lua, state: SharedBotState) -> mlua::Result<()> {
         "getBotRotation",
         lua.create_function(move |_, ()| {
             // Yaw (Z) from the on-foot quaternion, in degrees.
-            let q = s.borrow().rotation;
+            let q = s.borrow().on_foot.quaternion;
             let yaw = (2.0 * (q.w * q.z + q.x * q.y))
                 .atan2(1.0 - 2.0 * (q.y * q.y + q.z * q.z))
                 .to_degrees();
@@ -63,14 +63,19 @@ pub fn install_bindings(lua: &Lua, state: SharedBotState) -> mlua::Result<()> {
     let s = state.clone();
     globals.set(
         "getBotVehicle",
-        lua.create_function(move |_, ()| Ok(s.borrow().vehicle as i32))?,
+        lua.create_function(move |_, ()| Ok(s.borrow().vehicle_id() as i32))?,
     )?;
     let s = state.clone();
     globals.set(
         "setBotVehicle",
-        lua.create_function(move |_, (id, _seat): (u16, i32)| {
-            // TODO(phase6): actually enter the vehicle (RPC); for now just record the id.
-            s.borrow_mut().vehicle = id;
+        lua.create_function(move |_, (id, seat): (u16, i32)| {
+            // id 0 means "on foot"; otherwise record the vehicle the script put us in.
+            let mut bot = s.borrow_mut();
+            bot.vehicle = (id != 0).then(|| InVehicleData {
+                id,
+                seat: seat as u8,
+                ..InVehicleData::default()
+            });
             Ok(())
         })?,
     )?;

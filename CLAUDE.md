@@ -30,8 +30,8 @@ The gate must be green before claiming completion: `cargo fmt --all --check`,
 Run the client (binary is **`rakclient`**, not the crate name `app`):
 
 ```sh
-cargo run -p app -- --server <host:port> --nick <Nick> [--account-password <pw>]
-RUST_LOG=info ./target/release/rakclient.exe --server bumblebee.arizona-rp.com:7777 --nick <Nick> --account-password <pw>
+cargo run -p app -- --server <host:port> --nick <Nick> [--scripts-dir <dir>]
+RUST_LOG=info ./target/release/rakclient.exe --server bumblebee.arizona-rp.com:7777 --nick <Nick>
 ```
 
 `RUST_LOG` targets are the crate paths (`rakclient`, `raknet::transport`, `samp_client::driver`,
@@ -64,8 +64,11 @@ Layered workspace; each crate is one seam. Dependencies point downward only.
 
 - **`samp-script`** — the luau (mlua) scripting host mirroring the MoonLoader/SAMP.Lua API. Wraps each
   RPC/packet in a `bitStream` userdata and runs the script's `registerHandler` chokepoints; embeds a
-  typed-Luau `samp.events` port plus a reusable `luau/arizona.luau` launcher (server-specific
-  emulation lives here, not in the Rust core). Wired into the client via `connect_with_registry`.
+  typed-Luau `samp.events` port. Bundled abstractions only: `luau/packet.luau` (a generic chainable
+  packet builder) and `luau/arizona.luau` (the abstract Arizona CEF/validation packet *shapes*). The
+  launcher *identity* — auth key, versions, the `onSendClientJoin` handler — lives in the user script
+  (`example_scripts/arizona_launcher_emulation.luau`), not the bundle. Wired in via
+  `connect_with_registry`.
 
 - **`test-support`** — dev-only. `MockSampServer` binds a loopback UDP socket and frames its replies
   through the *same* `raknet::wire`/`cipher` primitives as the real client (the e2e test depends on
@@ -83,7 +86,8 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
 - `ClientJoin`: `version = 4057`, `challengeResponse = serverCookie ^ 0xFD9`. The driver sends it
   through the `onSendRPC` chokepoint, so a script's `onSendClientJoin` can rewrite it to a
   server-specific variant (e.g. Arizona's `modded=1` / fixed auth key / duplicated `challengeResponse`,
-  in `luau/arizona.luau`). The 7th field is included whenever a script is attached.
+  in the user script `example_scripts/arizona_launcher_emulation.luau`). The 7th field is included
+  whenever a script is attached.
 - The cipher is asymmetric: the client encrypts outbound datagrams; the server replies in the clear.
 - On-foot sync body is exactly 544 bits / 68 bytes; SA-MP text is **cp1251**, not UTF-8 (use
   `samp_proto::decode_cp1251` for chat).
@@ -92,16 +96,18 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
 
 - Servers run an anti-DDoS filter: the transport sends a raw `SAMP …i` query ping before the handshake
   and periodically, to self-whitelist its source IP. Without it the server drops all packets.
-- After join, Arizona expects the `220` CEF/validation packet sequence. This now lives in Luau
-  (`luau/arizona.luau`, used by the `example_scripts/arizona_launcher_emulation*.luau`), not in Rust.
+- After join, Arizona expects the `220` CEF/validation packet sequence. This now lives in Luau: the
+  abstract packet shapes in bundled `luau/arizona.luau`, wired up by the user script
+  `example_scripts/arizona_launcher_emulation.luau` (`*_classic.luau` does the same without the
+  builder). Not in Rust.
   The FSM runs its normal join → class → spawn flow; the script times its own validation via the Lua
   scheduler's `wait()` (like the reference addon's `newTask`/`wait`), so it lands within the server's
   validation window without any Rust-side spawn gate.
-- Login uses a `ShowDialog` (`Авторизация`) the driver auto-answers via `RPC_DialogResponse`. **Two
-  distinct passwords**: `ClientConfig.password` is the RakNet *connection* password (Arizona has none —
-  leave `None`); `account_password` is the login-dialog password. The app flags mirror this:
-  `--password` vs `--account-password`. Putting the account password in the connection slot causes an
-  `ID_INVALID_PASSWORD` rejection.
+- Login uses a `ShowDialog` (`Авторизация`). The Rust core does **not** answer it — the account
+  password and dialog response live in the (private) Arizona Luau script, which sees the dialog via the
+  `onReceiveRPC`/`samp.events.onShowDialog` chokepoint and replies with `sampSendDialogResponse`.
+  `ClientConfig.password` is only the RakNet *connection* password (Arizona has none — leave `None`);
+  there is no `account_password` in the Rust config any more.
 
 ## Conventions
 

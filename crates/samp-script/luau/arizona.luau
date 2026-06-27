@@ -1,69 +1,25 @@
 --!nonstrict
--- Reusable Arizona launcher emulation — lives in the Luau layer, not the Rust core.
+-- Bundled Arizona packet mechanics — ABSTRACT.
 --
--- `require('arizona')` installs a `samp.events.onSendClientJoin` handler that rewrites the join to
--- the Arizona variant and emits the CEF init + post-join validation packets a real Arizona client
--- sends. Other servers don't need any of this, which is exactly why it lives here.
---
--- Packets are built with a small typed, chainable builder, so each one reads as the fields it holds
--- (`u32(sampResolutionW)` instead of the magic bytes `128, 7, 0, 0`).
+-- This module carries the wire SHAPES of the Arizona CEF / validation packets, built on the generic
+-- `packet` builder. It holds no identity: the auth key, the client/app/join versions and the
+-- `onSendClientJoin` handler all live in the USER script that requires this (see
+-- example_scripts/arizona_launcher_emulation.luau). Change those there, not here.
 
-require("addon")
-local sampev = require("samp.events")
+require("addon") -- newTask/wait scheduler used by validation()
+local packet = require("packet")
 
 local AZ = 220 -- Arizona CEF / validation packet id
-local AUTH_KEY = "263083C359F5AE44AD3AFC8551F4208E6C84A36F6CC"
-local CLIENT_VERSION = "Arizona PC"
-local JOIN_VERSION = 4057
 
-local Packet = {}
-Packet.__index = Packet
-type Packet = typeof(setmetatable({} :: { bs: any }, Packet))
+local arizona = {}
 
--- Start a packet with its [220][subId] header.
-local function packet(subId: number): Packet
-    local self = setmetatable({ bs = bitStream.new() }, Packet)
-    self.bs:writeUInt8(AZ)
-    self.bs:writeUInt8(subId)
-    return self
+-- 220/18 CEF/Svelte message: [220][18][u16 len][text][u32 0][u16 0].
+function arizona.sendCef(text: string)
+    packet(AZ, 18):string16(text):u32(0):u16(0):send()
 end
 
-function Packet.u8(self: Packet, v: number): Packet
-    self.bs:writeUInt8(v)
-    return self
-end
-
-function Packet.u16(self: Packet, v: number): Packet
-    self.bs:writeUInt16(v)
-    return self
-end
-
-function Packet.u32(self: Packet, v: number): Packet
-    self.bs:writeUInt32(v)
-    return self
-end
-
-function Packet.text(self: Packet, v: string): Packet
-    self.bs:writeString(v)
-    return self
-end
-
--- A CEF string field: u16 length prefix, then the bytes.
-function Packet.cefString(self: Packet, v: string): Packet
-    self.bs:writeUInt16(#v)
-    self.bs:writeString(v)
-    return self
-end
-
-function Packet.send(self: Packet)
-    self.bs:sendPacket()
-end
-
-local function sendCef(message: string)
-    packet(18):cefString(message):u32(0):u16(0):send()
-end
-
-local function uniqueUserId(): string
+-- A random 64-char lowercase-hex id (Arizona's getUniqueUserId).
+function arizona.uniqueUserId(): string
     local chars = "0123456789abcdef"
     local id = table.create(64)
     for i = 1, 64 do
@@ -73,33 +29,23 @@ local function uniqueUserId(): string
     return table.concat(id)
 end
 
-local function sendGamePath()
+-- 220/140 fabricated game path: [220][140][u32 len][path][0]. Nick comes from the host getter.
+function arizona.gamePath()
     local path = string.format(
         '"gta_sa.exe"  -c -h  -p 7777 -n %s -mem 2048 -window -x -widescreen -graphics -enable_grass -arizona -userId %s -cdn 0,0,0 -referrer',
-        getBotNick(), uniqueUserId()
+        getBotNick(), arizona.uniqueUserId()
     )
-    packet(140):u32(#path):text(path):u8(0):send()
+    packet(AZ, 140):u32(#path):text(path):u8(0):send()
 end
 
-local function validation()
+-- The post-join validation set: 220/20 resolution, 220/50 focus, 220/38 client id, 220/140 path.
+-- Resolution is read from the host globals; waits ~1s first, like the reference launcher.
+function arizona.validation()
     wait(1000)
-    packet(20):u32(sampResolutionW or 1920):u32(sampResolutionH or 1080):send() -- resolution
-    packet(50):u8(1):send()                                                     -- window focused
-    packet(38):text(uniqueUserId()):send()                                      -- client id
-    sendGamePath()
+    packet(AZ, 20):u32(sampResolutionW or 1920):u32(sampResolutionH or 1080):send()
+    packet(AZ, 50):u8(1):send()
+    packet(AZ, 38):text(arizona.uniqueUserId()):send()
+    arizona.gamePath()
 end
 
-local arizona = {}
-
--- Register the join rewrite + CEF/validation. Called automatically on require; safe to call again.
-function arizona.install()
-    function sampev.onSendClientJoin(version, mod, nickname, challengeResponse, joinAuthKey, clientVer, challengeResponse2)
-        newTask(validation, 100)
-        sendCef("onSvelteAppInit")
-        sendCef("onSvelteAppVersion|1.0.0|ea94b29b")
-        return { JOIN_VERSION, 1, nickname, challengeResponse, AUTH_KEY, CLIENT_VERSION, challengeResponse2 }
-    end
-end
-
-arizona.install()
 return arizona

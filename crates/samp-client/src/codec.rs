@@ -4,8 +4,11 @@
 //! unit tests (where `samp_proto` is still a stub) while production forwards straight through.
 
 use samp_proto::{
-    BitStreamReader, ChatMessage, ClassId, ClientJoin, InitGame, OnFootSync, PlayerId,
-    RequestClassResponse, RequestSpawnResponse, Result as ProtoResult, ServerCookie, ServerMessage,
+    decode_client_message, decode_init_game, decode_player_chat, decode_request_class_response,
+    decode_request_spawn_response, encode_chat, encode_client_join, encode_on_foot_sync,
+    encode_request_class, encode_request_spawn, encode_spawn, generate_gpci, BitStreamReader,
+    ChatMessage, ClassId, ClientJoin, InitGame, OnFootSync, PlayerId, RequestClassResponse,
+    RequestSpawnResponse, Result as ProtoResult, ServerCookie, ServerMessage,
 };
 
 pub(crate) trait Codec {
@@ -42,50 +45,50 @@ impl Codec for SampProtoCodec {
     }
 
     fn encode_client_join(&self, join: &ClientJoin<'_>) -> Vec<u8> {
-        samp_proto::encode_client_join(join)
+        encode_client_join(join)
     }
 
     fn decode_init_game(&self, payload: &[u8]) -> ProtoResult<InitGame> {
-        samp_proto::decode_init_game(payload)
+        decode_init_game(payload)
     }
 
     fn encode_request_class(&self, class: ClassId) -> Vec<u8> {
-        samp_proto::encode_request_class(class)
+        encode_request_class(class)
     }
 
     fn decode_request_class_response(&self, payload: &[u8]) -> ProtoResult<RequestClassResponse> {
-        samp_proto::decode_request_class_response(payload)
+        decode_request_class_response(payload)
     }
 
     fn encode_request_spawn(&self) -> Vec<u8> {
-        samp_proto::encode_request_spawn()
+        encode_request_spawn()
     }
 
     fn decode_request_spawn_response(&self, payload: &[u8]) -> ProtoResult<RequestSpawnResponse> {
-        samp_proto::decode_request_spawn_response(payload)
+        decode_request_spawn_response(payload)
     }
 
     fn encode_spawn(&self) -> Vec<u8> {
-        samp_proto::encode_spawn()
+        encode_spawn()
     }
 
     fn encode_on_foot_sync(&self, sync: &OnFootSync) -> Vec<u8> {
-        samp_proto::encode_on_foot_sync(sync)
+        encode_on_foot_sync(sync)
     }
 
     fn decode_client_message(&self, payload: &[u8]) -> ProtoResult<ServerMessage> {
-        samp_proto::decode_client_message(payload)
+        decode_client_message(payload)
     }
 
     fn decode_player_chat(&self, payload: &[u8]) -> ProtoResult<ChatMessage> {
-        samp_proto::decode_player_chat(payload)
+        decode_player_chat(payload)
     }
 
     fn encode_chat(&self, text: &[u8]) -> Vec<u8> {
-        samp_proto::encode_chat(text)
+        encode_chat(text)
     }
 
     fn generate_gpci(&self) -> String {
-        samp_proto::generate_gpci()
+        generate_gpci()
     }
 }
