@@ -1,0 +1,17 @@
+[package]
+name = "samp-client"
+version = "0.1.0"
+edition = "2021"
+description = "SA-MP connection state machine and high-level async client."
+
+[dependencies]
+samp-proto = { workspace = true }
+raknet = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+test-support = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "net", "time", "sync", "macros"] }
