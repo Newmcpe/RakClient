@@ -1,0 +1,12 @@
+[package]
+name = "samp-proto"
+version = "0.1.0"
+edition = "2021"
+description = "SA-MP 0.3.7 wire protocol: BitStream, packet/RPC ids, and typed (de)serializers."
+
+[dependencies]
+thiserror = { workspace = true }
+inventory = "0.3"
+
+[dev-dependencies]
+proptest = "1"
