@@ -58,12 +58,14 @@ Layered workspace; each crate is one seam. Dependencies point downward only.
   the real `raknet`/`samp-proto` in production. `lib.rs` exposes `Client`, `ClientConfig`(+builder),
   `ConnectionState`, `ClientEvent`. The FSM is pumped one event at a time via `Client::next_event()`,
   which internally `select!`s transport events, the on-foot sync interval (while `Spawned`), the
-  reconnect timer, and the Arizona spawn-gate.
+  reconnect timer, and a generic post-join delay (`ClientConfig.post_join_delay`).
 
 - **`app`** — the `rakclient` binary: clap/env config → tracing → pump `next_event()` and log.
 
-- **`samp-script`** — early scaffold for a luau (mlua) scripting host mirroring the MoonLoader/SAMP.Lua
-  API. Not yet wired into the client.
+- **`samp-script`** — the luau (mlua) scripting host mirroring the MoonLoader/SAMP.Lua API. Wraps each
+  RPC/packet in a `bitStream` userdata and runs the script's `registerHandler` chokepoints; embeds a
+  typed-Luau `samp.events` port plus a reusable `luau/arizona.luau` launcher (server-specific
+  emulation lives here, not in the Rust core). Wired into the client via `connect_with_registry`.
 
 - **`test-support`** — dev-only. `MockSampServer` binds a loopback UDP socket and frames its replies
   through the *same* `raknet::wire`/`cipher` primitives as the real client (the e2e test depends on
@@ -78,8 +80,10 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
 
 ## Protocol provenance (don't guess these — they're reversed)
 
-- `ClientJoin`: `version = 4057`, `challengeResponse = serverCookie ^ 0xFD9`. Arizona variant appends
-  a duplicated `challengeResponse` (gated by `arizona_compat`, default on).
+- `ClientJoin`: `version = 4057`, `challengeResponse = serverCookie ^ 0xFD9`. The driver sends it
+  through the `onSendRPC` chokepoint, so a script's `onSendClientJoin` can rewrite it to a
+  server-specific variant (e.g. Arizona's `modded=1` / fixed auth key / duplicated `challengeResponse`,
+  in `luau/arizona.luau`). The 7th field is included whenever a script is attached.
 - The cipher is asymmetric: the client encrypts outbound datagrams; the server replies in the clear.
 - On-foot sync body is exactly 544 bits / 68 bytes; SA-MP text is **cp1251**, not UTF-8 (use
   `samp_proto::decode_cp1251` for chat).
@@ -88,9 +92,10 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
 
 - Servers run an anti-DDoS filter: the transport sends a raw `SAMP …i` query ping before the handshake
   and periodically, to self-whitelist its source IP. Without it the server drops all packets.
-- After join, the client sends the `220` CEF/validation packet sequence (`encode_az_*` in
-  `samp-proto`) ported from the reference MoonLoader addon, then a spawn-gate delay before requesting
-  spawn.
+- After join, Arizona expects the `220` CEF/validation packet sequence. This now lives in Luau
+  (`luau/arizona.luau`, used by the `example_scripts/arizona_launcher_emulation*.luau`), not in Rust.
+  The FSM holds the spawn-class request behind `ClientConfig.post_join_delay` (the app's
+  `--spawn-delay-ms`, ~1200 for Arizona) so those script packets reach the server first.
 - Login uses a `ShowDialog` (`Авторизация`) the driver auto-answers via `RPC_DialogResponse`. **Two
   distinct passwords**: `ClientConfig.password` is the RakNet *connection* password (Arizona has none —
   leave `None`); `account_password` is the login-dialog password. The app flags mirror this:

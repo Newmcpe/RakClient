@@ -31,14 +31,12 @@ pub use sync::{
 };
 
 pub use codec::{
-    build_az_game_path, decode_client_message, decode_init_game, decode_player_chat,
-    decode_request_class_response, decode_request_spawn_response, decode_show_dialog,
-    encode_az_cef_message, encode_az_client_id, encode_az_focus, encode_az_game_path,
-    encode_az_resolution, encode_chat, encode_client_join, encode_dialog_response,
-    encode_on_foot_sync, encode_request_class, encode_request_spawn, encode_spawn, generate_gpci,
-    generate_gpci_seeded, generate_user_id, generate_user_id_seeded, ChatMessage, ClientJoin,
-    InitGame, OnFootSync, RequestClassResponse, RequestSpawnResponse, ServerMessage, ShowDialog,
-    AZ_PACKET_ID, ON_FOOT_SYNC_LEN,
+    decode_client_message, decode_init_game, decode_player_chat, decode_request_class_response,
+    decode_request_spawn_response, decode_show_dialog, encode_chat, encode_client_join,
+    encode_dialog_response, encode_on_foot_sync, encode_request_class, encode_request_spawn,
+    encode_spawn, generate_gpci, generate_gpci_seeded, ChatMessage, ClientJoin, InitGame,
+    OnFootSync, RequestClassResponse, RequestSpawnResponse, ServerMessage, ShowDialog,
+    ON_FOOT_SYNC_LEN,
 };
 pub use ids::{RpcId, SyncPacketId};
 #[doc(hidden)]

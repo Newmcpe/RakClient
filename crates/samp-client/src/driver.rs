@@ -37,18 +37,12 @@ const RPC_SHOW_DIALOG: u8 = RpcId::ShowDialog as u8;
 
 const SPAWN_HEALTH: u8 = 100;
 
-/// Arizona-client `ClientJoin` identity (from the reference addon's `onSendClientJoin`): the join
-/// is sent `modded=1`, with this fixed auth key in the `joinAuthKey` slot and this client-version
-/// string. Used in place of the generic gpci/version when `arizona_compat` is set.
-const AZ_JOIN_AUTH_KEY: &str = "263083C359F5AE44AD3AFC8551F4208E6C84A36F6CC";
-const AZ_CLIENT_VERSION: &str = "Arizona PC";
-
 /// What woke the `select!` in [`Driver::step`].
 enum Step {
     Event(Option<RakEvent>),
     SyncTick,
     Reconnect,
-    SpawnGate,
+    PostJoinDelay,
     Update,
 }
 
@@ -62,9 +56,9 @@ pub(crate) struct Driver<T: Transport, C: Codec> {
     sync: OnFootSync,
     sync_timer: Option<Interval>,
     reconnect_timer: Option<Pin<Box<Sleep>>>,
-    /// One-shot delay between the Arizona validation packets and requesting spawn, giving the server
-    /// wall-clock time to process the validation (mirrors the reference addon's ~1s wait).
-    spawn_gate: Option<Pin<Box<Sleep>>>,
+    /// One-shot delay after `InitGame` before requesting the spawn class, giving a script's post-join
+    /// packets wall-clock time to reach the server. Armed from `config.post_join_delay` (zero ⇒ off).
+    post_join_timer: Option<Pin<Box<Sleep>>>,
     closed: bool,
     /// Packet-handler registry: scripts/observers intercept RPCs here before the FSM sees them.
     registry: PacketRegistry,
@@ -97,7 +91,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             sync: OnFootSync::default(),
             sync_timer: None,
             reconnect_timer: None,
-            spawn_gate: None,
+            post_join_timer: None,
             closed: false,
             registry: PacketRegistry::new(),
             update_timer: None,
@@ -137,7 +131,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     pub(crate) async fn disconnect(&mut self) -> raknet::Result<()> {
         self.sync_timer = None;
         self.reconnect_timer = None;
-        self.spawn_gate = None;
+        self.post_join_timer = None;
         self.closed = true;
         self.transport.disconnect().await
     }
@@ -155,7 +149,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
                 Step::Event(None) => self.on_transport_closed(),
                 Step::SyncTick => self.on_sync_tick().await,
                 Step::Reconnect => self.on_reconnect().await,
-                Step::SpawnGate => self.on_spawn_gate().await,
+                Step::PostJoinDelay => self.on_post_join_delay().await,
                 Step::Update => self.registry.tick(),
             }
             self.flush_outbox().await;
@@ -248,20 +242,20 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         let spawned = matches!(self.state, ConnectionState::Spawned);
         let has_reconnect = self.reconnect_timer.is_some();
         let has_sync = self.sync_timer.is_some();
-        let has_gate = self.spawn_gate.is_some();
+        let has_delay = self.post_join_timer.is_some();
         let has_update = self.update_timer.is_some();
         let Driver {
             transport,
             sync_timer,
             reconnect_timer,
-            spawn_gate,
+            post_join_timer,
             update_timer,
             ..
         } = self;
         tokio::select! {
             biased;
             _ = poll_sleep(reconnect_timer), if has_reconnect => Step::Reconnect,
-            _ = poll_sleep(spawn_gate), if has_gate => Step::SpawnGate,
+            _ = poll_sleep(post_join_timer), if has_delay => Step::PostJoinDelay,
             _ = poll_interval(sync_timer), if spawned && has_sync => Step::SyncTick,
             _ = poll_interval(update_timer), if has_update => Step::Update,
             event = transport.recv(), if !closed => Step::Event(event),
@@ -293,34 +287,27 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             .gpci
             .clone()
             .unwrap_or_else(|| self.codec.generate_gpci());
-        // Arizona identifies its client by the join: modded=1, a fixed auth key, "Arizona PC".
-        let (modded, auth, client_version) = if self.config.arizona_compat {
-            (true, AZ_JOIN_AUTH_KEY, AZ_CLIENT_VERSION)
-        } else {
-            (false, gpci.as_str(), self.config.client_version.as_str())
-        };
         let payload = {
             let join = ClientJoin {
                 version: SAMP_VERSION_0_3_7,
-                modded,
+                modded: false,
                 nick: self.config.nick.as_str(),
                 challenge_response,
-                auth,
-                client_version,
-                // Append the trailing `challengeResponse2` for Arizona, and also whenever a script
-                // is attached so a Lua `onSendClientJoin` rewrite has the 7th field to keep. Vanilla
-                // servers ignore the trailing bytes, so this is safe.
-                duplicate_challenge_response: self.config.arizona_compat
-                    || self.bot_state.is_some(),
+                auth: gpci.as_str(),
+                client_version: self.config.client_version.as_str(),
+                // Append the trailing `challengeResponse2` whenever a script is attached, so a Lua
+                // `onSendClientJoin` rewrite (e.g. the Arizona variant) has the 7th field to keep.
+                // Vanilla servers ignore the trailing bytes, so this is safe.
+                duplicate_challenge_response: self.bot_state.is_some(),
             };
             self.codec.encode_client_join(&join)
         };
         self.transition(ConnectionState::RakNetConnected);
         self.pending.push_back(ClientEvent::Connected);
+        // The join goes through the `onSendRPC` chokepoint, so a script can rewrite it before it
+        // hits the wire. Scripts send their own post-join packets (e.g. Arizona CEF) on `onConnect`;
+        // the outbox is flushed after this step.
         self.send_rpc(RpcId::ClientJoin as u8, payload).await;
-        self.send_az_cef_init().await;
-        // Scripts send their own post-join packets here (e.g. the Arizona CEF init when the Rust
-        // emulation is disabled); the outbox is flushed after this step.
         self.registry.dispatch_lifecycle("onConnect");
         self.transition(ConnectionState::Joining);
     }
@@ -491,31 +478,30 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             local_id: self.local_id,
             host_name,
         });
-        // Scripts send their post-init packets (e.g. Arizona validation) before the class request;
-        // flush immediately so they reach the wire ahead of it.
+        // Scripts send their post-init packets (e.g. a server's post-join validation) before the
+        // class request; flush immediately so they reach the wire ahead of it.
         self.registry.dispatch_lifecycle("onInitGame");
         self.flush_outbox().await;
-        if self.config.arizona_compat {
-            // Arizona's post-join validation (220/20/50/38/140) must reach and be processed by the
-            // server before we spawn, otherwise it flags the client ("ОШИБКА 7721") and kicks ~5s
-            // after spawn. Send it now, then gate the spawn request behind a short delay so the
-            // server has wall-clock time to validate (mirrors the reference addon's ~1s wait).
-            self.send_az_validation().await;
-            self.spawn_gate = Some(Box::pin(time::sleep(Duration::from_millis(1200))));
+        // Some servers must process a script's post-join packets before the client spawns (Arizona
+        // kicks otherwise). When `post_join_delay` is set, hold the class request behind it so those
+        // packets get wall-clock time; otherwise request the class immediately.
+        if self.config.post_join_delay.is_zero() {
+            self.request_spawn_class().await;
         } else {
-            let payload = self.codec.encode_request_class(self.config.default_class);
-            self.send_rpc(RpcId::RequestClass as u8, payload).await;
-            self.transition(ConnectionState::ClassSelection);
+            self.post_join_timer = Some(Box::pin(time::sleep(self.config.post_join_delay)));
         }
     }
 
-    /// Fired once the post-validation spawn gate elapses: now request the class, resuming the normal
-    /// class → spawn flow.
-    async fn on_spawn_gate(&mut self) {
-        self.spawn_gate = None;
-        if !matches!(self.state, ConnectionState::Joined { .. }) {
-            return;
+    /// Fired once the post-join delay elapses: request the class, resuming the normal class → spawn
+    /// flow.
+    async fn on_post_join_delay(&mut self) {
+        self.post_join_timer = None;
+        if matches!(self.state, ConnectionState::Joined { .. }) {
+            self.request_spawn_class().await;
         }
+    }
+
+    async fn request_spawn_class(&mut self) {
         let payload = self.codec.encode_request_class(self.config.default_class);
         self.send_rpc(RpcId::RequestClass as u8, payload).await;
         self.transition(ConnectionState::ClassSelection);
@@ -652,7 +638,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     fn on_disconnect(&mut self, reason: DisconnectReason) {
-        self.spawn_gate = None;
+        self.post_join_timer = None;
         if let Some(aim) = self.aim.as_mut() {
             aim.reset();
         }
@@ -686,54 +672,6 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     pub(crate) async fn send_chat(&mut self, text: &[u8]) {
         let payload = self.codec.encode_chat(text);
         self.send_rpc(RpcId::Chat as u8, payload).await;
-    }
-
-    /// Send a raw Arizona `220` custom packet (reliable-ordered, ordering channel 0 — matching the
-    /// reference addon's default `sendPacket`).
-    async fn send_az_packet(&mut self, data: Vec<u8>) {
-        if let Err(error) = self
-            .transport
-            .send(data, Reliability::ReliableOrdered, 0)
-            .await
-        {
-            tracing::warn!(%error, "failed to send arizona 220 packet");
-            self.on_disconnect(DisconnectReason::ConnectionLost);
-        }
-    }
-
-    /// The CEF/Svelte app-init pair the Arizona client emits immediately after `ClientJoin`
-    /// (`220/18`). No-op unless `arizona_compat` is set.
-    async fn send_az_cef_init(&mut self) {
-        if !self.config.arizona_compat {
-            return;
-        }
-        self.send_az_packet(samp_proto::encode_az_cef_message("onSvelteAppInit"))
-            .await;
-        self.send_az_packet(samp_proto::encode_az_cef_message(
-            &self.config.az_app_version.clone(),
-        ))
-        .await;
-    }
-
-    /// The post-join validation set the Arizona client sends ~1s after join (`220/20` resolution,
-    /// `220/50` focus, `220/38` client id, `220/140` fabricated game path). Sent once on spawn,
-    /// which lands ~1s after join — within the server's post-spawn validation window. No-op unless
-    /// `arizona_compat` is set.
-    async fn send_az_validation(&mut self) {
-        if !self.config.arizona_compat {
-            return;
-        }
-        let (w, h) = self.config.az_resolution;
-        self.send_az_packet(samp_proto::encode_az_resolution(w, h))
-            .await;
-        self.send_az_packet(samp_proto::encode_az_focus(true)).await;
-        let client_id = samp_proto::generate_user_id();
-        self.send_az_packet(samp_proto::encode_az_client_id(&client_id))
-            .await;
-        let user_id = samp_proto::generate_user_id();
-        let path = samp_proto::build_az_game_path(&self.config.nick, &user_id);
-        self.send_az_packet(samp_proto::encode_az_game_path(&path))
-            .await;
     }
 
     fn transition(&mut self, next: ConnectionState) {
@@ -999,9 +937,6 @@ mod tests {
         )
         .sync_interval(Duration::from_millis(100))
         .reconnect_delay(Duration::from_secs(5))
-        // The scripted FSM tests exercise the direct vanilla flow; the Arizona spawn-gate/validation
-        // path is verified live, not against the scripted transport.
-        .arizona_compat(false)
         .build()
     }
 

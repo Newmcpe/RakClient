@@ -37,7 +37,15 @@ cargo build --workspace
 Запустить клиент (имя бинарника — `rakclient`, а не `app`):
 
 ```sh
-cargo run -p app -- --server bumblebee.arizona-rp.com:7777 --nick ВашНик
+cargo run -p app -- --server <хост:порт> --nick ВашНик
+```
+
+Для серверов **Arizona** эмуляция (CEF/валидация) живёт в Lua, а не в Rust — загрузите лаунчер и
+дайте его пакетам дойти до сервера через `--spawn-delay-ms`:
+
+```sh
+cargo run -p app -- --server bumblebee.arizona-rp.com:7777 --nick ВашНик \
+  --script example_scripts/arizona_launcher_emulation.luau --spawn-delay-ms 1200
 ```
 
 Если у аккаунта есть пароль для входа (диалог авторизации на сервере), добавьте его:

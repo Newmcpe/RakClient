@@ -58,14 +58,10 @@ pub struct ClientConfig {
     pub gpci: Option<String>,
     pub sync_interval: Duration,
     pub reconnect_delay: Duration,
-    /// Send the Arizona ClientJoin variant (trailing duplicated `challengeResponse`) and the
-    /// post-join `220` CEF/validation packet sequence that keeps Arizona servers from kicking at
-    /// ~5s. Default `true`; set `false` for strict-vanilla SA-MP servers.
-    pub arizona_compat: bool,
-    /// `onSvelteAppVersion|…` string sent in the Arizona CEF init (`220/18`).
-    pub az_app_version: String,
-    /// Display resolution `(width, height)` reported in the Arizona validation (`220/20`).
-    pub az_resolution: (u32, u32),
+    /// Delay after `InitGame` before requesting the spawn class, giving a script's post-join packets
+    /// (e.g. a server's validation sequence) wall-clock time to be processed. `Duration::ZERO` ⇒ no
+    /// delay (request the class immediately). Server-agnostic; the caller sets it per server.
+    pub post_join_delay: Duration,
     /// Send native aim-sync packets (a believable, rate-limited camera/aim) while spawned. Default
     /// `true`; set `false` to send no aim sync.
     pub aim_sync: bool,
@@ -84,9 +80,7 @@ impl ClientConfig {
                 gpci: None,
                 sync_interval: Duration::from_millis(100),
                 reconnect_delay: Duration::from_secs(5),
-                arizona_compat: true,
-                az_app_version: "onSvelteAppVersion|1.0.0|ea94b29b".to_string(),
-                az_resolution: (1920, 1080),
+                post_join_delay: Duration::ZERO,
                 aim_sync: true,
             },
         }
@@ -129,9 +123,10 @@ impl ClientConfigBuilder {
         self.config.reconnect_delay = delay;
         self
     }
-    /// Toggle the Arizona ClientJoin variant (default on). Disable for strict-vanilla servers.
-    pub fn arizona_compat(mut self, enabled: bool) -> Self {
-        self.config.arizona_compat = enabled;
+    /// Delay between `InitGame` and the spawn-class request, letting a script's post-join packets
+    /// land first. `Duration::ZERO` (default) requests the class immediately.
+    pub fn post_join_delay(mut self, delay: Duration) -> Self {
+        self.config.post_join_delay = delay;
         self
     }
     pub fn build(self) -> ClientConfig {

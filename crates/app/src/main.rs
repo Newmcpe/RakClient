@@ -50,9 +50,18 @@ struct Cli {
     )]
     client_version: String,
 
-    /// Disable the Arizona ClientJoin variant (send a strict-vanilla join).
-    #[arg(long = "no-arizona-compat", env = "RAKCLIENT_NO_ARIZONA_COMPAT")]
-    no_arizona_compat: bool,
+    /// Milliseconds to wait after `InitGame` before requesting spawn, letting a script's post-join
+    /// packets land first (Arizona needs ~1200). `0` requests the class immediately.
+    #[arg(
+        long = "spawn-delay-ms",
+        env = "RAKCLIENT_SPAWN_DELAY_MS",
+        default_value_t = 0
+    )]
+    spawn_delay_ms: u64,
+
+    /// Display resolution `WxH` exposed to scripts as `sampResolutionW` / `sampResolutionH`.
+    #[arg(long, env = "RAKCLIENT_RESOLUTION", default_value = "1920x1080")]
+    resolution: String,
 
     /// Disable native aim-sync (the believable rate-limited camera/aim sent while spawned).
     #[arg(long = "no-aim-sync", env = "RAKCLIENT_NO_AIM_SYNC")]
@@ -77,11 +86,18 @@ impl Cli {
             gpci: None,
             sync_interval: Duration::from_millis(200),
             reconnect_delay: Duration::from_secs(5),
-            arizona_compat: !self.no_arizona_compat,
-            az_app_version: "onSvelteAppVersion|1.0.0|ea94b29b".to_string(),
-            az_resolution: (1920, 1080),
+            post_join_delay: Duration::from_millis(self.spawn_delay_ms),
             aim_sync: !self.no_aim_sync,
         })
+    }
+
+    /// Parse the `WxH` resolution string into `(width, height)`.
+    fn resolution(&self) -> anyhow::Result<(u32, u32)> {
+        let (w, h) = self
+            .resolution
+            .split_once('x')
+            .ok_or_else(|| anyhow!("resolution must be `WxH`, got `{}`", self.resolution))?;
+        Ok((w.trim().parse()?, h.trim().parse()?))
     }
 }
 
@@ -145,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let engine = load_script_engine(cli.script.clone())?.map(Rc::new);
+    let resolution = cli.resolution()?;
     let config = cli.into_config()?;
     info!(server = %config.server, nick = %config.nick, "connecting");
 
@@ -162,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
             engine
                 .install_sender(registry.outbox())
                 .map_err(|e| anyhow!("installing script sender: {e}"))?;
-            let (width, height) = config.az_resolution;
+            let (width, height) = resolution;
             for (key, value) in [("sampResolutionW", width), ("sampResolutionH", height)] {
                 engine
                     .set_global(key, value)
@@ -248,7 +265,8 @@ mod tests {
         assert_eq!(cli.password, None);
         assert_eq!(cli.class, 0);
         assert_eq!(cli.client_version, "0.3.7-R3");
-        assert!(!cli.no_arizona_compat); // Arizona ClientJoin variant on by default
+        assert_eq!(cli.spawn_delay_ms, 0); // vanilla: request class immediately
+        assert_eq!(cli.resolution, "1920x1080");
     }
 
     #[test]

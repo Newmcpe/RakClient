@@ -2,21 +2,6 @@ use super::*;
 use crate::SAMP_VERSION_0_3_7;
 
 #[test]
-fn az_init_packets_golden_bytes() {
-    let mut cef = vec![AZ_PACKET_ID, 18, 15, 0];
-    cef.extend_from_slice(b"onSvelteAppInit");
-    cef.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    assert_eq!(encode_az_cef_message("onSvelteAppInit"), cef);
-
-    assert_eq!(
-        encode_az_resolution(1920, 1080),
-        [AZ_PACKET_ID, 20, 128, 7, 0, 0, 56, 4, 0, 0]
-    );
-    assert_eq!(encode_az_focus(true), [AZ_PACKET_ID, 50, 1]);
-    assert_eq!(encode_az_focus(false), [AZ_PACKET_ID, 50, 0]);
-}
-
-#[test]
 fn client_join_golden_vector() {
     let join = ClientJoin {
         version: SAMP_VERSION_0_3_7,
