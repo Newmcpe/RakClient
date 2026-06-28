@@ -77,9 +77,13 @@ local function validation()
     sendGamePath()
 end
 
-function sampev.onSendClientJoin(version, mod, nickname, challengeResponse, joinAuthKey, clientVer, challengeResponse2)
+function sampev.onSendClientJoin(
+    version: number, mod: number, nickname: string, challengeResponse: number,
+    joinAuthKey: string, clientVer: string, challengeResponse2: number
+)
     newTask(validation, 100)
     sendCef("onSvelteAppInit")
     sendCef("onSvelteAppVersion|1.0.0|ea94b29b")
-    return { 4057, 1, nickname, challengeResponse, "263083C359F5AE44AD3AFC8551F4208E6C84A36F6CC", "Arizona PC", challengeResponse2 }
+    -- `joinAuthKey` is the driver's random `generate_gpci` (a valid ×1001 token) — no hardcoded key.
+    return { 4057, 1, nickname, challengeResponse, joinAuthKey, "Arizona PC", challengeResponse2 }
 end

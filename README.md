@@ -5,7 +5,7 @@ from `RakSAMP Lite.exe`. It drives the full connection → play sequence:
 
 ```
 Disconnected → Connecting → RakNet-connected → Joining (ClientJoin)
-→ Joined (InitGame) → ClassSelection → SpawnRequested → Spawned → InGame (on-foot sync)
+→ Joined (InitGame) → ClassSelection → ClassSelected → Spawned → InGame (on-foot sync)
 ```
 
 Faithful enough to talk to a real 0.3.7 server: it implements the SA-MP "RakNet 3.x" reliable/ordered

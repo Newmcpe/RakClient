@@ -7,6 +7,8 @@
 /.serena/
 # JetBrains IDE project files
 /.idea/
+# local-only auto-loaded scripts dir (holds private credentials)
+/scripts/
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb

@@ -42,10 +42,13 @@ RUST_LOG=info ./target/release/rakclient.exe --server bumblebee.arizona-rp.com:7
 Layered workspace; each crate is one seam. Dependencies point downward only.
 
 - **`samp-proto`** — pure codecs, zero I/O. `BitStream{Reader,Writer}` (MSB-first bit packing,
-  little-endian multibyte), `RpcId`/`SyncPacketId` enums, and `encode_*`/`decode_*` free functions
-  for every RPC/packet body (the id byte is prepended by the transport, never by a codec). This crate
-  is the public contract everything else compiles against. Wire layouts are byte-exact ports verified
-  against the binary — change them only with a golden-vector test.
+  little-endian multibyte), `RpcId`/`SyncPacketId` enums, and a per-packet trait family in `codec.rs`:
+  every RPC/packet body is a struct implementing `Packet` (the `const ID`) plus `Encode` (client→server
+  `fn encode(&self) -> Vec<u8>`) and/or `Decode` (server→client `fn decode(payload) -> Result<Self>`),
+  with the id byte prepended by the transport, never by a body. (`parse_connect`/`generate_gpci` stay
+  free functions — they are connection-level, not packet bodies.) This crate is the public contract
+  everything else compiles against. Wire layouts are byte-exact ports verified against the binary —
+  change them only with a golden-vector test.
 
 - **`raknet`** — the SA-MP RakNet 3.x transport. `cipher.rs` + `tables.rs` (port-keyed 256-byte
   substitution cipher), `reliability.rs` (datagram seq, ACK/NAK, ordered channels, split/reassembly),
@@ -53,9 +56,10 @@ Layered workspace; each crate is one seam. Dependencies point downward only.
   reliability layer through the cipher, `tokio::select!` over recv/command/tick). `wire.rs` holds the
   handshake/RPC framing constants shared with `test-support` so client and mock frame identically.
 
-- **`samp-client`** — the connection state machine. `driver.rs` `Driver<T: Transport, C: Codec>` is
-  the FSM, generic over transport and codec seams so it runs against a scripted fake in unit tests and
-  the real `raknet`/`samp-proto` in production. `lib.rs` exposes `Client`, `ClientConfig`(+builder),
+- **`samp-client`** — the connection state machine. `driver.rs` `Driver<T: Transport>` is the FSM,
+  generic over the transport seam so it runs against a scripted fake in unit tests and the real
+  `raknet` in production; packet bodies are encoded/decoded through the `samp_proto` `Encode`/`Decode`
+  traits. `lib.rs` exposes `Client`, `ClientConfig`(+builder),
   `ConnectionState`, `ClientEvent`. The FSM is pumped one event at a time via `Client::next_event()`,
   which internally `select!`s transport events, the on-foot sync interval (while `Spawned`), the
   reconnect timer, and the script `onUpdate` tick.
@@ -100,12 +104,17 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
   abstract packet shapes in bundled `luau/arizona.luau`, wired up by the user script
   `example_scripts/arizona_launcher_emulation.luau` (`*_classic.luau` does the same without the
   builder). Not in Rust.
-  The FSM runs its normal join → class → spawn flow; the script times its own validation via the Lua
-  scheduler's `wait()` (like the reference addon's `newTask`/`wait`), so it lands within the server's
-  validation window without any Rust-side spawn gate.
+  After join the FSM sends `RequestClass` and then **spectates** (spectator-sync 212) instead of
+  spawning immediately — spawning before login earns "ОШИБКА 7721". The script times its own
+  validation via the Lua scheduler's `wait()` (like the reference addon's `newTask`/`wait`), so it
+  lands within the server's validation window.
 - Login uses a `ShowDialog` (`Авторизация`). The Rust core does **not** answer it — the account
   password and dialog response live in the (private) Arizona Luau script, which sees the dialog via the
-  `onReceiveRPC`/`samp.events.onShowDialog` chokepoint and replies with `sampSendDialogResponse`.
+  `onReceiveRPC`/`samp.events.onShowDialog` chokepoint and replies with `sampSendDialogResponse`. The
+  driver then **spawns** automatically: a login `DialogResponse` (RPC 62) sent while spectating sets
+  `spawn_after_login`, and the pump loop calls `enter_spawned()` → `RPC_Spawn` → `Spawned` (the order
+  the real client uses). Fallback spawn triggers cover non-Arizona servers: `TogglePlayerSpectating`
+  (RPC 124) on a `1 → 0` transition, and `RequestSpawnResponse(allow==2)`.
   `ClientConfig.password` is only the RakNet *connection* password (Arizona has none — leave `None`);
   there is no `account_password` in the Rust config any more.
 
@@ -117,3 +126,9 @@ adding behavior, prefer wiring it into the driver FSM or a codec rather than the
 - New wire formats need a golden-vector or round-trip test next to the codec. Live-network tests are
   `#[ignore]`-gated (run with `--include-ignored`).
 - Never log credentials (the account password).
+- Prefer typed Luau over dynamic Lua. New `.luau` (host modules in `crates/samp-script/luau/` and
+  example scripts) start with `--!strict` and carry type annotations on function params, returns,
+  locals where inferred poorly, and table shapes. Reserve `--!nonstrict`/`any` for genuinely dynamic
+  edges (the `bitStream` userdata, raw RPC payloads) and annotate the boundary; do not reach for
+  `any` to silence the type checker. Script text is UTF-8 — the host transcodes cp1251 at the wire
+  boundary, so scripts never hand-roll byte strings for text.
