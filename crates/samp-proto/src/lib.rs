@@ -32,12 +32,10 @@ pub use sync::{
 };
 
 pub use codec::{
-    decode_client_message, decode_init_game, decode_player_chat, decode_request_class_response,
-    decode_request_spawn_response, decode_show_dialog, encode_chat, encode_client_join,
-    encode_dialog_response, encode_on_foot_sync, encode_request_class, encode_request_spawn,
-    encode_spawn, generate_gpci, generate_gpci_seeded, ChatMessage, ClientJoin, InitGame,
-    OnFootSync, RequestClassResponse, RequestSpawnResponse, ServerMessage, ShowDialog,
-    ON_FOOT_SYNC_LEN,
+    generate_gpci, generate_gpci_seeded, parse_connect, ChatMessage, ChatOutgoing, ClientJoin,
+    Decode, DialogResponse, Encode, InitGame, OnFootSync, Packet, RequestClass,
+    RequestClassResponse, RequestSpawn, RequestSpawnResponse, ServerMessage, ShowDialog, Spawn,
+    SpectatorSync, ON_FOOT_SYNC_LEN,
 };
 pub use ids::{RpcId, SyncPacketId};
 #[doc(hidden)]
@@ -54,10 +52,6 @@ pub enum ProtoError {
     Exhausted { needed: usize, available: usize },
     #[error("invalid UTF-8 in protocol string")]
     InvalidString,
-    #[error("unknown RPC id {0}")]
-    UnknownRpc(u8),
-    #[error("unknown packet id {0}")]
-    UnknownPacket(u8),
     #[error("malformed packet: {0}")]
     Malformed(&'static str),
 }

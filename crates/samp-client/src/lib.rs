@@ -5,11 +5,11 @@
 //!
 //! ```text
 //! Disconnected → Connecting → RakNetConnected → Joining → Joined
-//!   → ClassSelection → ClassSelected → SpawnRequested → Spawned
+//!   → ClassSelection → ClassSelected → Spawned
 //! ```
 //!
 //! The crate root holds the public contract; the FSM lives in the private [`driver`] module driven
-//! over the [`transport`] and [`codec`] seams.
+//! over the [`transport`] seam.
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -20,11 +20,11 @@ use thiserror::Error;
 
 mod aim;
 mod client_emulation;
-mod codec;
 mod driver;
 mod registry;
 mod state;
 mod transport;
+mod type3;
 
 pub use registry::{Action, PacketRegistry};
 pub use samp_proto::{Direction, OutboundMsg, Outbox, Verdict};
@@ -125,7 +125,6 @@ pub enum ConnectionState {
     },
     ClassSelection,
     ClassSelected,
-    SpawnRequested,
     Spawned,
 }
 
@@ -155,7 +154,7 @@ pub enum ClientEvent {
 
 /// High-level async SA-MP client. Owns a [`raknet::RakHandle`] and drives the FSM.
 pub struct Client {
-    driver: driver::Driver<transport::RakTransport, codec::SampProtoCodec>,
+    driver: driver::Driver<transport::RakTransport>,
 }
 
 impl Client {
@@ -166,7 +165,7 @@ impl Client {
             static_data: Vec::new(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
-        let driver = driver::Driver::new(config, transport, codec::SampProtoCodec);
+        let driver = driver::Driver::new(config, transport);
         Ok(Self { driver })
     }
 
@@ -184,7 +183,7 @@ impl Client {
             static_data: Vec::new(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
-        let driver = driver::Driver::new(config, transport, codec::SampProtoCodec)
+        let driver = driver::Driver::new(config, transport)
             .with_registry(registry)
             .with_bot_state(bot_state);
         Ok(Self { driver })

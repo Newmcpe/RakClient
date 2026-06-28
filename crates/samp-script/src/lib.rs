@@ -14,7 +14,7 @@ use mlua::{Function, IntoLua, IntoLuaMulti, Lua, Table, Value, Variadic};
 mod bindings;
 mod bitstream;
 mod require;
-use samp_proto::{OutboundMsg, Outbox, Verdict};
+use samp_proto::{Encode, OutboundMsg, Outbox, Verdict};
 
 /// Outgoing chat lines a script queued via `sampSendChat`, buffered until the host drains them.
 /// Already encoded to the wire encoding (cp1251): scripts pass UTF-8 and the host transcodes.
@@ -159,7 +159,13 @@ impl ScriptEngine {
         let send_dialog = self.lua.create_function(
             move |_, (id, button, list_item, input): (u16, u8, u16, mlua::String)| {
                 let input = samp_proto::encode_cp1251(&input.to_string_lossy());
-                let payload = samp_proto::encode_dialog_response(id, button, list_item, &input);
+                let payload = samp_proto::DialogResponse {
+                    dialog_id: id,
+                    button,
+                    list_item,
+                    input: &input,
+                }
+                .encode();
                 dialogs
                     .borrow_mut()
                     .push_back(OutboundMsg::Rpc { id: 62, payload });

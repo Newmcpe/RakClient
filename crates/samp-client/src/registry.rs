@@ -49,7 +49,7 @@ impl PacketRegistry {
     /// `T` before the handler runs — so the handler works with typed fields, never the raw
     /// bitstream. Return [`Action::Rewrite`] with a mutated value to re-encode it.
     ///
-    /// ```ignore
+    /// ```text
     /// registry.register::<PlayerStreamIn>(|ev| {
     ///     println!("player {} streamed in at {:?}", ev.player_id, ev.position);
     ///     Action::Pass

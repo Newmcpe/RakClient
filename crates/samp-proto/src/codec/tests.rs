@@ -12,7 +12,7 @@ fn client_join_golden_vector() {
         client_version: "0.3.7",
         duplicate_challenge_response: false,
     };
-    let bytes = encode_client_join(&join);
+    let bytes = join.encode();
     let expected = vec![
         0xD9, 0x0F, 0x00, 0x00, // version 4057, little-endian
         0x01, // modded = 1
@@ -35,7 +35,7 @@ fn client_join_unmodded_byte() {
         client_version: "",
         duplicate_challenge_response: false,
     };
-    let bytes = encode_client_join(&join);
+    let bytes = join.encode();
     assert_eq!(bytes[4], 0x00); // modded byte
 }
 
@@ -50,11 +50,12 @@ fn client_join_arizona_appends_trailing_challenge() {
         client_version: "0.3.7-R3",
         duplicate_challenge_response: false,
     };
-    let vanilla = encode_client_join(&base);
-    let arizona = encode_client_join(&ClientJoin {
+    let vanilla = base.encode();
+    let arizona = ClientJoin {
         duplicate_challenge_response: true,
         ..base.clone()
-    });
+    }
+    .encode();
     // Arizona form == vanilla form + a trailing little-endian copy of challenge_response.
     assert_eq!(&arizona[..vanilla.len()], vanilla.as_slice());
     assert_eq!(&arizona[vanilla.len()..], &[0x78, 0x56, 0x34, 0x12]);
@@ -69,23 +70,23 @@ fn init_game_roundtrip() {
     w.write_str8("Los Santos Roleplay");
     let payload = w.into_bytes();
 
-    let game = decode_init_game(&payload).unwrap();
+    let game = InitGame::decode(&payload).unwrap();
     assert_eq!(game.local_player_id, PlayerId(0x1234));
     assert_eq!(game.host_name, "Los Santos Roleplay");
 }
 
 #[test]
 fn init_game_truncated_errs() {
-    assert!(decode_init_game(&[]).is_err());
-    assert!(decode_init_game(&[0u8; 13]).is_err()); // enough to skip but not read id
+    assert!(InitGame::decode(&[]).is_err());
+    assert!(InitGame::decode(&[0u8; 13]).is_err()); // enough to skip but not read id
 }
 
 #[test]
 fn request_class_roundtrip() {
-    let bytes = encode_request_class(ClassId(7));
+    let bytes = RequestClass { class: ClassId(7) }.encode();
     assert_eq!(bytes, vec![0x07, 0x00, 0x00, 0x00]);
 
-    let bytes = encode_request_class(ClassId(-1));
+    let bytes = RequestClass { class: ClassId(-1) }.encode();
     assert_eq!(bytes, vec![0xFF, 0xFF, 0xFF, 0xFF]);
 }
 
@@ -102,7 +103,7 @@ fn request_class_response_allowed() {
     let mut payload = vec![0x01u8]; // allow
     payload.extend_from_slice(&info);
 
-    let resp = decode_request_class_response(&payload).unwrap();
+    let resp = RequestClassResponse::decode(&payload).unwrap();
     assert!(resp.allowed);
     assert_eq!(resp.skin, Skin(42));
     assert_eq!(
@@ -117,26 +118,26 @@ fn request_class_response_allowed() {
 
 #[test]
 fn request_class_response_denied_has_no_spawn_info() {
-    let resp = decode_request_class_response(&[0x00]).unwrap();
+    let resp = RequestClassResponse::decode(&[0x00]).unwrap();
     assert!(!resp.allowed);
 }
 
 #[test]
 fn request_class_response_truncated_errs() {
-    assert!(decode_request_class_response(&[]).is_err());
-    assert!(decode_request_class_response(&[1, 2, 3]).is_err());
+    assert!(RequestClassResponse::decode(&[]).is_err());
+    assert!(RequestClassResponse::decode(&[1, 2, 3]).is_err());
 }
 
 #[test]
 fn spawn_response_roundtrip() {
-    assert_eq!(decode_request_spawn_response(&[2]).unwrap().allow, 2);
-    assert!(decode_request_spawn_response(&[]).is_err());
+    assert_eq!(RequestSpawnResponse::decode(&[2]).unwrap().allow, 2);
+    assert!(RequestSpawnResponse::decode(&[]).is_err());
 }
 
 #[test]
 fn empty_bodies() {
-    assert!(encode_request_spawn().is_empty());
-    assert!(encode_spawn().is_empty());
+    assert!(RequestSpawn.encode().is_empty());
+    assert!(Spawn.encode().is_empty());
 }
 
 #[test]
@@ -159,7 +160,7 @@ fn on_foot_sync_layout() {
         weapon: WeaponId(24),
         special_action: 5,
     };
-    let body = encode_on_foot_sync(&sync);
+    let body = sync.encode();
     assert_eq!(body.len(), ON_FOOT_SYNC_LEN);
 
     let mut r = BitStreamReader::new(&body);
@@ -202,41 +203,44 @@ fn generate_gpci_runs() {
 #[test]
 fn client_message_decodes_color_and_text() {
     // White, length 1, " " — the exact shape captured live from Arizona Bumble Bee.
-    let msg = decode_client_message(&[0xff, 0xff, 0xff, 0xff, 0x01, 0, 0, 0, 0x20]).unwrap();
+    let msg = ServerMessage::decode(&[0xff, 0xff, 0xff, 0xff, 0x01, 0, 0, 0, 0x20]).unwrap();
     assert_eq!(msg.color, 0xffff_ffff);
     assert_eq!(msg.text, b" ");
 }
 
 #[test]
 fn client_message_truncated_errs() {
-    assert!(decode_client_message(&[0xff, 0xff]).is_err());
+    assert!(ServerMessage::decode(&[0xff, 0xff]).is_err());
     // colour + length present but text shorter than the declared length.
-    assert!(decode_client_message(&[0, 0, 0, 0, 0x05, 0, 0, 0, b'h', b'i']).is_err());
+    assert!(ServerMessage::decode(&[0, 0, 0, 0, 0x05, 0, 0, 0, b'h', b'i']).is_err());
 }
 
 #[test]
 fn player_chat_decodes_id_and_text() {
-    let msg = decode_player_chat(&[0x2a, 0x00, 0x03, b'y', b'o', b'!']).unwrap();
+    let msg = ChatMessage::decode(&[0x2a, 0x00, 0x03, b'y', b'o', b'!']).unwrap();
     assert_eq!(msg.player_id.0, 42);
     assert_eq!(msg.text, b"yo!");
 }
 
 #[test]
 fn player_chat_truncated_errs() {
-    assert!(decode_player_chat(&[0x05]).is_err());
-    assert!(decode_player_chat(&[0x05, 0x00, 0x04, b'h']).is_err());
+    assert!(ChatMessage::decode(&[0x05]).is_err());
+    assert!(ChatMessage::decode(&[0x05, 0x00, 0x04, b'h']).is_err());
 }
 
 #[test]
 fn chat_encodes_length_prefixed() {
-    assert_eq!(encode_chat(b"hello"), vec![5, b'h', b'e', b'l', b'l', b'o']);
-    assert_eq!(encode_chat(b""), vec![0]);
+    assert_eq!(
+        ChatOutgoing { text: b"hello" }.encode(),
+        vec![5, b'h', b'e', b'l', b'l', b'o']
+    );
+    assert_eq!(ChatOutgoing { text: b"" }.encode(), vec![0]);
 }
 
 #[test]
 fn chat_encode_truncates_over_255_bytes() {
     let long = vec![b'a'; 300];
-    let encoded = encode_chat(&long);
+    let encoded = ChatOutgoing { text: &long }.encode();
     assert_eq!(encoded[0], 255);
     assert_eq!(encoded.len(), 256);
 }
@@ -252,7 +256,7 @@ fn show_dialog_decodes_structural_head() {
     p.push(6);
     p.extend_from_slice(b"Cancel");
     p.extend_from_slice(b"...body...");
-    let d = decode_show_dialog(&p).unwrap();
+    let d = ShowDialog::decode(&p).unwrap();
     assert_eq!(d.dialog_id, 2);
     assert_eq!(d.style, 3);
     assert_eq!(d.title, b"Login");
@@ -262,14 +266,20 @@ fn show_dialog_decodes_structural_head() {
 
 #[test]
 fn show_dialog_truncated_errs() {
-    assert!(decode_show_dialog(&[0x02, 0x00]).is_err());
-    assert!(decode_show_dialog(&[0x02, 0x00, 0x03, 0x05, b'h', b'i']).is_err());
+    assert!(ShowDialog::decode(&[0x02, 0x00]).is_err());
+    assert!(ShowDialog::decode(&[0x02, 0x00, 0x03, 0x05, b'h', b'i']).is_err());
 }
 
 #[test]
 fn dialog_response_layout() {
     // dialogId=2, button=1, listItem=0xFFFF, input="secret"
-    let bytes = encode_dialog_response(2, 1, 0xFFFF, b"secret");
+    let bytes = DialogResponse {
+        dialog_id: 2,
+        button: 1,
+        list_item: 0xFFFF,
+        input: b"secret",
+    }
+    .encode();
     assert_eq!(
         bytes,
         vec![0x02, 0x00, 0x01, 0xFF, 0xFF, 0x06, b's', b'e', b'c', b'r', b'e', b't']

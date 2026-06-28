@@ -107,6 +107,14 @@ pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()>
             Ok(())
         })?,
     )?;
+    let s = state.clone();
+    globals.set(
+        "sampSpawnPlayer",
+        lua.create_function(move |_, ()| {
+            s.borrow_mut().spawn_requested = true;
+            Ok(())
+        })?,
+    )?;
     let s = state;
     globals.set(
         "reconnect",
