@@ -3,21 +3,29 @@
 --
 -- The reusable plumbing lives in bundled modules: `packet` (the chainable byte builder) and
 -- `arizona` (the abstract CEF/validation packet shapes). Everything launcher-specific lives HERE:
--- the auth key, the client/app/join versions, and the `onSendClientJoin` handler that wires them.
--- Copy this file and change the four constants below to emulate a different launcher.
+-- the client/app/join versions, the server host, and the `onSendClientJoin` handler. The gpci/auth
+-- key is RANDOM by default: the driver's `generate_gpci` hands a fresh valid `×1001` token in as
+-- `joinAuthKey` (the server only enforces that format), and the bundled `arizona` module randomizes
+-- the 220/140 `-userId` and 220/38 client-id per run — so there is nothing machine-specific to capture.
 
 require("addon")
 local sampev = require("samp.events")
 local arizona = require("arizona")
 
-local AUTH_KEY = "263083C359F5AE44AD3AFC8551F4208E6C84A36F6CC"
 local CLIENT_VERSION = "Arizona PC"
-local APP_VERSION = "onSvelteAppVersion|1.0.0|ea94b29b"
+local APP_VERSION = "onSvelteAppVersion|1021|3e7f1e99"
+local SERVER_HOST = "bumblebee.arizona-rp.com"
 local JOIN_VERSION = 4057
 
-function sampev.onSendClientJoin(version, mod, nickname, challengeResponse, joinAuthKey, clientVer, challengeResponse2)
-    newTask(arizona.validation, 100)
-    arizona.sendCef("onSvelteAppInit")
+function sampev.onSendClientJoin(
+    version: number, mod: number, nickname: string, challengeResponse: number,
+    joinAuthKey: string, clientVer: string, challengeResponse2: number
+)
+    arizona.host = SERVER_HOST
+    -- Pre-join CEF, in the real client's order.
     arizona.sendCef(APP_VERSION)
-    return { JOIN_VERSION, 1, nickname, challengeResponse, AUTH_KEY, CLIENT_VERSION, challengeResponse2 }
+    arizona.sendCef("inventoryItemsLoaded")
+    -- Post-join validation set (220/140, 20, 50, 38, onSvelteAppInit) fires shortly after.
+    newTask(arizona.validation, 100)
+    return { JOIN_VERSION, 1, nickname, challengeResponse, joinAuthKey, CLIENT_VERSION, challengeResponse2 }
 end

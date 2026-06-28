@@ -14,7 +14,10 @@ local sampev = require("samp.events")
 local ACCOUNT_PASSWORD = "CHANGE_ME"
 
 -- button 1 = the confirm/login button; 65535 = no listbox selection; input = the password.
-function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
+function sampev.onShowDialog(
+    dialogId: number, style: number, title: string,
+    button1: string, button2: string, text: string
+)
     if title:find("Авторизация") then
         sampSendDialogResponse(dialogId, 1, 65535, ACCOUNT_PASSWORD)
         return false
