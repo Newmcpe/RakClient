@@ -172,21 +172,23 @@ fn assert_arizona_launcher(rel_path: &str) {
         .expect("bindings");
     engine.load_script(&source, rel_path).expect("load");
 
-    // A 7-field ClientJoin (RPC 25). onSendClientJoin should rewrite it to the Arizona variant
-    // and queue the two CEF packets via sendCef → bitStream:sendPacket.
-    let join = vec![
-        0xD9, 0x0F, 0x00, 0x00, 0x00, 0x03, b'B', b'o', b't', 0x44, 0x33, 0x22, 0x11, 0x00, 0x01,
-        b'x', 0x44, 0x33, 0x22, 0x11,
+    // A 7-field ClientJoin (RPC 25) carrying a sample auth key. onSendClientJoin should rewrite it to
+    // the Arizona variant (modded=1, "Arizona PC") and PASS THE DRIVER'S auth key (`joinAuthKey`)
+    // THROUGH — the launcher examples no longer hardcode one (it is the random `generate_gpci`). It
+    // also queues the two CEF packets via sendCef → bitStream:sendPacket.
+    let auth = b"263083C359F5AE44AD3AFC8551F4208E6C84A36F6CC";
+    let mut join = vec![
+        0xD9, 0x0F, 0x00, 0x00, 0x00, 0x03, b'B', b'o', b't', 0x44, 0x33, 0x22, 0x11,
     ];
+    join.push(auth.len() as u8);
+    join.extend_from_slice(auth);
+    join.extend_from_slice(&[0x01, b'x', 0x44, 0x33, 0x22, 0x11]);
     match engine.dispatch_chokepoint("onSendRPC", 25, &join) {
         Verdict::Rewrite(bytes) => {
             assert_eq!(bytes[4], 1, "modded");
             let has = |n: &[u8]| bytes.windows(n.len()).any(|w| w == n);
             assert!(has(b"Arizona PC"), "client version");
-            assert!(
-                has(b"263083C359F5AE44AD3AFC8551F4208E6C84A36F6CC"),
-                "auth key"
-            );
+            assert!(has(auth), "auth key passed through from joinAuthKey");
         }
         other => panic!("expected rewrite, got {other:?}"),
     }

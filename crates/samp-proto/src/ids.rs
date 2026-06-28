@@ -1,12 +1,19 @@
 //! RPC and sync packet identifiers (verified against the binary's RPC id table & sync sender).
+//!
+//! `TryFrom<u8>` / `From<Self> for u8` come from `num_enum`; the variant list (`Self::VARIANTS`,
+//! the equivalent of Java's `Enum.values()`) comes from `strum::VariantArray`.
 
-use crate::{ProtoError, Result};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use strum::VariantArray;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, VariantArray)]
 #[repr(u8)]
 pub enum RpcId {
     ClientJoin = 25,
     Spawn = 52,
+    /// Server→client dialog (login/registration/menus). Body:
+    /// `[u16 dialogId][u8 style][str8 title][str8 button1][str8 button2][compressed body]`.
+    ShowDialog = 61,
     /// Client→server reply to a `ShowDialog`: `[u16 dialogId][u8 button][u16 listItem][u8 len][text]`.
     DialogResponse = 62,
     /// Server→client coloured text line (SA-MP `SendClientMessage`); also how Arizona delivers
@@ -21,35 +28,9 @@ pub enum RpcId {
     ServerJoin = 137,
     ServerQuit = 138,
     InitGame = 139,
-    /// Server→client dialog (login/registration/menus). Body:
-    /// `[u16 dialogId][u8 style][str8 title][str8 button1][str8 button2][compressed body]`.
-    ShowDialog = 61,
 }
 
-impl TryFrom<u8> for RpcId {
-    type Error = ProtoError;
-
-    /// ```
-    /// use samp_proto::RpcId;
-    /// assert_eq!(RpcId::try_from(25).unwrap(), RpcId::ClientJoin);
-    /// assert!(RpcId::try_from(200).is_err());
-    /// ```
-    fn try_from(value: u8) -> Result<Self> {
-        Ok(match value {
-            25 => RpcId::ClientJoin,
-            52 => RpcId::Spawn,
-            128 => RpcId::RequestClass,
-            129 => RpcId::RequestSpawn,
-            130 => RpcId::ConnectionRejected,
-            137 => RpcId::ServerJoin,
-            138 => RpcId::ServerQuit,
-            139 => RpcId::InitGame,
-            other => return Err(ProtoError::UnknownRpc(other)),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive, VariantArray)]
 #[repr(u8)]
 pub enum SyncPacketId {
     VehicleSync = 200,
@@ -65,64 +46,45 @@ pub enum SyncPacketId {
     SpectatorSync = 212,
 }
 
-impl TryFrom<u8> for SyncPacketId {
-    type Error = ProtoError;
-
-    /// ```
-    /// use samp_proto::SyncPacketId;
-    /// assert_eq!(SyncPacketId::try_from(207).unwrap(), SyncPacketId::PlayerSync);
-    /// assert!(SyncPacketId::try_from(0).is_err());
-    /// ```
-    fn try_from(value: u8) -> Result<Self> {
-        Ok(match value {
-            200 => SyncPacketId::VehicleSync,
-            203 => SyncPacketId::AimSync,
-            204 => SyncPacketId::WeaponsUpdate,
-            206 => SyncPacketId::BulletSync,
-            207 => SyncPacketId::PlayerSync,
-            208 => SyncPacketId::MarkersSync,
-            209 => SyncPacketId::UnoccupiedSync,
-            210 => SyncPacketId::TrailerSync,
-            211 => SyncPacketId::PassengerSync,
-            212 => SyncPacketId::SpectatorSync,
-            other => return Err(ProtoError::UnknownPacket(other)),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn rpc_known_ids() {
-        assert_eq!(RpcId::try_from(25), Ok(RpcId::ClientJoin));
-        assert_eq!(RpcId::try_from(139), Ok(RpcId::InitGame));
-        assert_eq!(RpcId::ClientJoin as u8, 25);
+        assert_eq!(RpcId::try_from(25u8).unwrap(), RpcId::ClientJoin);
+        assert_eq!(RpcId::try_from(139u8).unwrap(), RpcId::InitGame);
+        assert_eq!(u8::from(RpcId::ClientJoin), 25);
     }
 
     #[test]
     fn rpc_unknown_id_errs() {
-        assert_eq!(RpcId::try_from(0), Err(ProtoError::UnknownRpc(0)));
-        assert_eq!(RpcId::try_from(255), Err(ProtoError::UnknownRpc(255)));
+        assert!(RpcId::try_from(0u8).is_err());
+        assert!(RpcId::try_from(255u8).is_err());
     }
 
     #[test]
     fn sync_known_ids() {
-        assert_eq!(SyncPacketId::try_from(207), Ok(SyncPacketId::PlayerSync));
-        assert_eq!(SyncPacketId::try_from(200), Ok(SyncPacketId::VehicleSync));
-        assert_eq!(SyncPacketId::PlayerSync as u8, 207);
+        assert_eq!(
+            SyncPacketId::try_from(207u8).unwrap(),
+            SyncPacketId::PlayerSync
+        );
+        assert_eq!(
+            SyncPacketId::try_from(200u8).unwrap(),
+            SyncPacketId::VehicleSync
+        );
+        assert_eq!(u8::from(SyncPacketId::PlayerSync), 207);
     }
 
     #[test]
     fn sync_unknown_id_errs() {
-        assert_eq!(
-            SyncPacketId::try_from(199),
-            Err(ProtoError::UnknownPacket(199))
-        );
-        assert_eq!(
-            SyncPacketId::try_from(213),
-            Err(ProtoError::UnknownPacket(213))
-        );
+        assert!(SyncPacketId::try_from(199u8).is_err());
+        assert!(SyncPacketId::try_from(213u8).is_err());
+    }
+
+    #[test]
+    fn variants_list_like_java_values() {
+        assert!(RpcId::VARIANTS.contains(&RpcId::Spawn));
+        assert_eq!(SyncPacketId::VARIANTS.len(), 10);
     }
 }

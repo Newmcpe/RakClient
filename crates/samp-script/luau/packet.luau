@@ -84,6 +84,12 @@ function Packet.send(self: Packet)
     self.bs:sendPacket()
 end
 
+-- Send with explicit priority/reliability/channel (sampfuncs constants: reliability 9 =
+-- RELIABLE_ORDERED). Arizona's 220 packets go on channel 2, priority 1, reliability 9.
+function Packet.sendEx(self: Packet, priority: number, reliability: number, channel: number)
+    self.bs:sendPacketEx(priority, reliability, channel)
+end
+
 function Packet.sendRpc(self: Packet, id: number)
     self.bs:sendRPC(id)
 end

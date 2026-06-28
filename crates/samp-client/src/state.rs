@@ -134,6 +134,9 @@ pub struct LocalPlayer {
     pub force_sync: bool,
     /// Set by `reconnect(ms)`; the driver schedules a reconnect after this delay and clears it.
     pub reconnect_in_ms: Option<u64>,
+    /// Set by `sampSpawnPlayer()`; in the Arizona flow the driver sends `RPC_Spawn` and clears it. The
+    /// script calls this after the login (or registration) dialog flow completes.
+    pub spawn_requested: bool,
 }
 
 /// [`LocalPlayer`] shared between the (non-`Send`) driver and script engine on the client thread.
@@ -154,6 +157,7 @@ impl LocalPlayer {
             camera_pos: Vector3::default(),
             force_sync: false,
             reconnect_in_ms: None,
+            spawn_requested: false,
         }
     }
 

@@ -1,13 +1,32 @@
 //! RPC payloads and the on-foot sync body, ported from the 0.3.7 client.
 //!
-//! Every encoder produces the RPC/packet *body*; the id byte is prepended by the transport.
+//! Each packet/RPC is a struct that knows its wire id ([`Packet::ID`]); client→server bodies
+//! implement [`Encode`] and server→client bodies implement [`Decode`]. The id byte itself is
+//! prepended by the transport, never by these bodies.
 
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
-use crate::{ClassId, PlayerId, Quaternion, Result, Skin, Vector3, WeaponId};
+use crate::ids::{RpcId, SyncPacketId};
+use crate::{ClassId, PlayerId, Quaternion, Result, ServerCookie, Skin, Vector3, WeaponId};
+
+/// Every packet/RPC knows its id; the transport frames the id byte before the body.
+pub trait Packet {
+    /// The RPC/sync id byte that precedes this body on the wire.
+    const ID: u8;
+}
+
+/// Client→server body: serializes itself (the id byte is NOT included).
+pub trait Encode: Packet {
+    fn encode(&self) -> Vec<u8>;
+}
+
+/// Server→client body: parses from the payload (the id byte is already stripped).
+pub trait Decode: Packet + Sized {
+    fn decode(payload: &[u8]) -> Result<Self>;
+}
 
 /// Outgoing `RPC_ClientJoin` (25). `challenge_response` is `server_cookie ^ CHALLENGE_XOR`.
 ///
-/// When `duplicate_challenge_response` is set, `encode_client_join` appends a trailing copy of
+/// When `duplicate_challenge_response` is set, [`ClientJoin::encode`] appends a trailing copy of
 /// `challenge_response` as a 7th field — the Arizona 0.3.7-R3 client variant (verified in
 /// `samp.dll:0x1000AA20`, where the join sender writes `challengeResponse` twice). Vanilla SA-MP
 /// reads only the first six fields and ignores the trailing bytes, so this is safe to leave on; set
@@ -23,22 +42,28 @@ pub struct ClientJoin<'a> {
     pub duplicate_challenge_response: bool,
 }
 
-/// Build the `RPC_ClientJoin` body. Field order/sizes verified against
-/// `Net_OnConnAccepted_SendClientJoin` (0x4572C0):
-/// `version:u32, modded:u8, nick:str8, challenge_response:u32, auth:str8, client_version:str8`.
-/// The Arizona variant appends a duplicated `challenge_response:u32` as a 7th field.
-pub fn encode_client_join(join: &ClientJoin<'_>) -> Vec<u8> {
-    let mut w = BitStreamWriter::new();
-    w.write_u32(join.version);
-    w.write_u8(join.modded as u8);
-    w.write_str8(join.nick);
-    w.write_u32(join.challenge_response);
-    w.write_str8(join.auth);
-    w.write_str8(join.client_version);
-    if join.duplicate_challenge_response {
-        w.write_u32(join.challenge_response);
+impl Packet for ClientJoin<'_> {
+    const ID: u8 = RpcId::ClientJoin as u8;
+}
+
+impl Encode for ClientJoin<'_> {
+    /// Build the `RPC_ClientJoin` body. Field order/sizes verified against
+    /// `Net_OnConnAccepted_SendClientJoin` (0x4572C0):
+    /// `version:u32, modded:u8, nick:str8, challenge_response:u32, auth:str8, client_version:str8`.
+    /// The Arizona variant appends a duplicated `challenge_response:u32` as a 7th field.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_u32(self.version);
+        w.write_u8(self.modded as u8);
+        w.write_str8(self.nick);
+        w.write_u32(self.challenge_response);
+        w.write_str8(self.auth);
+        w.write_str8(self.client_version);
+        if self.duplicate_challenge_response {
+            w.write_u32(self.challenge_response);
+        }
+        w.into_bytes()
     }
-    w.into_bytes()
 }
 
 // `RPC_InitGame` (139) bit layout (RPC_InitGame @0x458F90). The original handler consumes many
@@ -56,30 +81,61 @@ pub struct InitGame {
     pub host_name: String,
 }
 
-/// Decode `RPC_InitGame`, extracting our assigned player id and the server host name.
-///
-/// ```
-/// use samp_proto::decode_init_game;
-/// assert!(decode_init_game(&[]).is_err());
-/// ```
-pub fn decode_init_game(payload: &[u8]) -> Result<InitGame> {
-    let mut r = BitStreamReader::new(payload);
-    r.skip_bits(INIT_GAME_BITS_BEFORE_PLAYER_ID)?;
-    let local_player_id = PlayerId(r.read_u16()?);
-    r.skip_bits(INIT_GAME_BITS_BETWEEN_PLAYER_ID_AND_HOSTNAME)?;
-    let host_name = r.read_str8()?;
-    Ok(InitGame {
-        local_player_id,
-        host_name,
-    })
+impl Packet for InitGame {
+    const ID: u8 = RpcId::InitGame as u8;
+}
+
+impl Decode for InitGame {
+    /// Decode `RPC_InitGame`, extracting our assigned player id and the server host name.
+    ///
+    /// ```
+    /// use samp_proto::{Decode, InitGame};
+    /// assert!(InitGame::decode(&[]).is_err());
+    /// ```
+    fn decode(payload: &[u8]) -> Result<Self> {
+        let mut r = BitStreamReader::new(payload);
+        r.skip_bits(INIT_GAME_BITS_BEFORE_PLAYER_ID)?;
+        let local_player_id = PlayerId(r.read_u16()?);
+        r.skip_bits(INIT_GAME_BITS_BETWEEN_PLAYER_ID_AND_HOSTNAME)?;
+        let host_name = r.read_str8()?;
+        Ok(InitGame {
+            local_player_id,
+            host_name,
+        })
+    }
+}
+
+impl Encode for InitGame {
+    /// Re-encode a minimal valid `RPC_InitGame`: the skipped server-settings blocks are zero-filled,
+    /// so `InitGame::decode(x.encode())` recovers `local_player_id` and `host_name` — the only two
+    /// fields this crate models. Used by the mock server / unit tests to produce a join payload.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_zero_bits(INIT_GAME_BITS_BEFORE_PLAYER_ID);
+        w.write_u16(self.local_player_id.0);
+        w.write_zero_bits(INIT_GAME_BITS_BETWEEN_PLAYER_ID_AND_HOSTNAME);
+        w.write_str8(&self.host_name);
+        w.into_bytes()
+    }
 }
 
 /// Outgoing `RPC_RequestClass` (128) — body is the class id as a 32-bit integer
 /// (Net_SendRequestClass @0x455AC0).
-pub fn encode_request_class(class: ClassId) -> Vec<u8> {
-    let mut w = BitStreamWriter::new();
-    w.write_i32(class.0);
-    w.into_bytes()
+#[derive(Debug, Clone, Copy)]
+pub struct RequestClass {
+    pub class: ClassId,
+}
+
+impl Packet for RequestClass {
+    const ID: u8 = RpcId::RequestClass as u8;
+}
+
+impl Encode for RequestClass {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_i32(self.class.0);
+        w.into_bytes()
+    }
 }
 
 // Offsets within the 46-byte `PLAYER_SPAWN_INFO` blob (read by sub_401F80; field offsets confirmed
@@ -96,34 +152,65 @@ pub struct RequestClassResponse {
     pub skin: Skin,
 }
 
-/// Decode the class-selection response. `allow != 0` is followed by a 46-byte spawn-info blob.
-///
-/// ```
-/// use samp_proto::decode_request_class_response;
-/// // allow byte says "yes" but the spawn-info blob is missing -> error, not panic.
-/// assert!(decode_request_class_response(&[1]).is_err());
-/// ```
-pub fn decode_request_class_response(payload: &[u8]) -> Result<RequestClassResponse> {
-    let mut r = BitStreamReader::new(payload);
-    let allow = r.read_u8()?;
-    if allow == 0 {
-        return Ok(RequestClassResponse::default());
+impl Packet for RequestClassResponse {
+    const ID: u8 = RpcId::RequestClass as u8;
+}
+
+impl Decode for RequestClassResponse {
+    /// Decode the class-selection response. `allow != 0` is followed by a 46-byte spawn-info blob.
+    ///
+    /// ```
+    /// use samp_proto::{Decode, RequestClassResponse};
+    /// // allow byte says "yes" but the spawn-info blob is missing -> error, not panic.
+    /// assert!(RequestClassResponse::decode(&[1]).is_err());
+    /// ```
+    fn decode(payload: &[u8]) -> Result<Self> {
+        let mut r = BitStreamReader::new(payload);
+        let allow = r.read_u8()?;
+        if allow == 0 {
+            return Ok(RequestClassResponse::default());
+        }
+        let info = r.read_bytes(SPAWN_INFO_LEN)?;
+        let skin = Skin(u16::from_le_bytes([
+            info[SPAWN_INFO_SKIN_OFFSET],
+            info[SPAWN_INFO_SKIN_OFFSET + 1],
+        ]));
+        let spawn_position = Vector3 {
+            x: read_f32_at(&info, SPAWN_INFO_POS_OFFSET),
+            y: read_f32_at(&info, SPAWN_INFO_POS_OFFSET + 4),
+            z: read_f32_at(&info, SPAWN_INFO_POS_OFFSET + 8),
+        };
+        Ok(RequestClassResponse {
+            allowed: true,
+            spawn_position,
+            skin,
+        })
     }
-    let info = r.read_bytes(SPAWN_INFO_LEN)?;
-    let skin = Skin(u16::from_le_bytes([
-        info[SPAWN_INFO_SKIN_OFFSET],
-        info[SPAWN_INFO_SKIN_OFFSET + 1],
-    ]));
-    let spawn_position = Vector3 {
-        x: read_f32_at(&info, SPAWN_INFO_POS_OFFSET),
-        y: read_f32_at(&info, SPAWN_INFO_POS_OFFSET + 4),
-        z: read_f32_at(&info, SPAWN_INFO_POS_OFFSET + 8),
-    };
-    Ok(RequestClassResponse {
-        allowed: true,
-        spawn_position,
-        skin,
-    })
+}
+
+impl Encode for RequestClassResponse {
+    /// Re-encode the class-selection response (inverse of [`RequestClassResponse::decode`]): a
+    /// denied response is the single `0` allow byte; an allowed one is `1` followed by the 46-byte
+    /// spawn-info blob carrying `skin`/`spawn_position`. Used by the mock server / unit tests.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        if !self.allowed {
+            w.write_u8(0);
+            return w.into_bytes();
+        }
+        w.write_u8(1);
+        let mut info = [0u8; SPAWN_INFO_LEN];
+        info[SPAWN_INFO_SKIN_OFFSET..SPAWN_INFO_SKIN_OFFSET + 2]
+            .copy_from_slice(&self.skin.0.to_le_bytes());
+        info[SPAWN_INFO_POS_OFFSET..SPAWN_INFO_POS_OFFSET + 4]
+            .copy_from_slice(&self.spawn_position.x.to_le_bytes());
+        info[SPAWN_INFO_POS_OFFSET + 4..SPAWN_INFO_POS_OFFSET + 8]
+            .copy_from_slice(&self.spawn_position.y.to_le_bytes());
+        info[SPAWN_INFO_POS_OFFSET + 8..SPAWN_INFO_POS_OFFSET + 12]
+            .copy_from_slice(&self.spawn_position.z.to_le_bytes());
+        w.write_bytes(&info);
+        w.into_bytes()
+    }
 }
 
 fn read_f32_at(buf: &[u8], offset: usize) -> f32 {
@@ -136,8 +223,17 @@ fn read_f32_at(buf: &[u8], offset: usize) -> f32 {
 }
 
 /// Outgoing `RPC_RequestSpawn` (129) — empty body (Net_SendRequestSpawn @0x455D50).
-pub fn encode_request_spawn() -> Vec<u8> {
-    Vec::new()
+#[derive(Debug, Clone, Copy)]
+pub struct RequestSpawn;
+
+impl Packet for RequestSpawn {
+    const ID: u8 = RpcId::RequestSpawn as u8;
+}
+
+impl Encode for RequestSpawn {
+    fn encode(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// Incoming `RPC_RequestSpawn` response (129). `allow == 2`, or `allow != 0` while spawn was
@@ -147,26 +243,75 @@ pub struct RequestSpawnResponse {
     pub allow: u8,
 }
 
-/// Decode the spawn response (single allow byte).
-///
-/// ```
-/// use samp_proto::decode_request_spawn_response;
-/// assert!(decode_request_spawn_response(&[]).is_err());
-/// ```
-pub fn decode_request_spawn_response(payload: &[u8]) -> Result<RequestSpawnResponse> {
-    let mut r = BitStreamReader::new(payload);
-    Ok(RequestSpawnResponse {
-        allow: r.read_u8()?,
-    })
+impl Packet for RequestSpawnResponse {
+    const ID: u8 = RpcId::RequestSpawn as u8;
+}
+
+impl Decode for RequestSpawnResponse {
+    /// Decode the spawn response (single allow byte).
+    ///
+    /// ```
+    /// use samp_proto::{Decode, RequestSpawnResponse};
+    /// assert!(RequestSpawnResponse::decode(&[]).is_err());
+    /// ```
+    fn decode(payload: &[u8]) -> Result<Self> {
+        let mut r = BitStreamReader::new(payload);
+        Ok(RequestSpawnResponse {
+            allow: r.read_u8()?,
+        })
+    }
+}
+
+impl Encode for RequestSpawnResponse {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_u8(self.allow);
+        w.into_bytes()
+    }
 }
 
 /// Outgoing `RPC_Spawn` (52) — empty body (Net_Spawn @0x455BB0).
-pub fn encode_spawn() -> Vec<u8> {
-    Vec::new()
+#[derive(Debug, Clone, Copy)]
+pub struct Spawn;
+
+impl Packet for Spawn {
+    const ID: u8 = RpcId::Spawn as u8;
+}
+
+impl Encode for Spawn {
+    fn encode(&self) -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+/// Outgoing spectator sync body (`ID_SPECTATOR_SYNC` = 212): `lrAnalog:u16, udAnalog:u16, keys:u16,
+/// position:3xf32` (18 bytes). The real Arizona client spectates — sending this — while it answers the
+/// login dialog, and only spawns afterwards; sending on-foot sync before login earns "ОШИБКА 7721".
+/// The id byte is prepended by the transport.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpectatorSync {
+    pub position: Vector3,
+}
+
+impl Packet for SpectatorSync {
+    const ID: u8 = SyncPacketId::SpectatorSync as u8;
+}
+
+impl Encode for SpectatorSync {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_u16(0); // lrAnalog
+        w.write_u16(0); // udAnalog
+        w.write_u16(0); // keys
+        w.write_f32(self.position.x);
+        w.write_f32(self.position.y);
+        w.write_f32(self.position.z);
+        w.into_bytes()
+    }
 }
 
 /// Outgoing on-foot sync body (`ID_PLAYER_SYNC` = 207).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct OnFootSync {
     pub keys: u16,
     pub position: Vector3,
@@ -181,46 +326,52 @@ pub struct OnFootSync {
 /// (0x455210).
 pub const ON_FOOT_SYNC_LEN: usize = 68;
 
-/// Encode the 544-bit on-foot sync body. Layout (byte offsets) ported from Net_SendInGameSync's
-/// on-foot branch:
-/// `lrAnalog:u16@0, udAnalog:u16@2, keys:u16@4, position:3xf32@6, quaternion:4xf32@18,
-/// health:u8@34, armour:u8@35, weapon:u8@36, special_action:u8@37, moveSpeed:3xf32@38,
-/// surfOffset:3xf32@50, surfVehicle:u16@62, animIndex:u16@64, animFlags:u16@66`.
-///
-/// The id byte is prepended by the caller/transport.
-pub fn encode_on_foot_sync(sync: &OnFootSync) -> Vec<u8> {
-    let mut w = BitStreamWriter::new();
-    // Left/right + up/down analog steering: the original sender zeroes these.
-    w.write_u16(0);
-    w.write_u16(0);
-    w.write_u16(sync.keys);
-    w.write_f32(sync.position.x);
-    w.write_f32(sync.position.y);
-    w.write_f32(sync.position.z);
-    // TODO(verify): quaternion component order — modelled as (x, y, z, w) to match `Quaternion`;
-    // the binary copies 16 raw bytes from the rotation state.
-    w.write_f32(sync.quaternion.x);
-    w.write_f32(sync.quaternion.y);
-    w.write_f32(sync.quaternion.z);
-    w.write_f32(sync.quaternion.w);
-    w.write_u8(sync.health);
-    w.write_u8(sync.armour);
-    w.write_u8(sync.weapon.0);
-    w.write_u8(sync.special_action);
-    // Move speed (x, y, z): unmodelled, zeroed.
-    w.write_f32(0.0);
-    w.write_f32(0.0);
-    w.write_f32(0.0);
-    // Surfing offset (x, y, z): unmodelled, zeroed.
-    w.write_f32(0.0);
-    w.write_f32(0.0);
-    w.write_f32(0.0);
-    w.write_u16(0); // surfing vehicle id
-                    // TODO(verify): the binary writes a fixed animation pair (animIndex=0x04A5, animFlags=0x8004);
-                    // we send a neutral 0/0 since OnFootSync does not model animation state.
-    w.write_u16(0); // animation index
-    w.write_u16(0); // animation flags
-    w.into_bytes()
+impl Packet for OnFootSync {
+    const ID: u8 = SyncPacketId::PlayerSync as u8;
+}
+
+impl Encode for OnFootSync {
+    /// Encode the 544-bit on-foot sync body. Layout (byte offsets) ported from Net_SendInGameSync's
+    /// on-foot branch:
+    /// `lrAnalog:u16@0, udAnalog:u16@2, keys:u16@4, position:3xf32@6, quaternion:4xf32@18,
+    /// health:u8@34, armour:u8@35, weapon:u8@36, special_action:u8@37, moveSpeed:3xf32@38,
+    /// surfOffset:3xf32@50, surfVehicle:u16@62, animIndex:u16@64, animFlags:u16@66`.
+    ///
+    /// The id byte is prepended by the caller/transport.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        // Left/right + up/down analog steering: the original sender zeroes these.
+        w.write_u16(0);
+        w.write_u16(0);
+        w.write_u16(self.keys);
+        w.write_f32(self.position.x);
+        w.write_f32(self.position.y);
+        w.write_f32(self.position.z);
+        // TODO(verify): quaternion component order — modelled as (x, y, z, w) to match `Quaternion`;
+        // the binary copies 16 raw bytes from the rotation state.
+        w.write_f32(self.quaternion.x);
+        w.write_f32(self.quaternion.y);
+        w.write_f32(self.quaternion.z);
+        w.write_f32(self.quaternion.w);
+        w.write_u8(self.health);
+        w.write_u8(self.armour);
+        w.write_u8(self.weapon.0);
+        w.write_u8(self.special_action);
+        // Move speed (x, y, z): unmodelled, zeroed.
+        w.write_f32(0.0);
+        w.write_f32(0.0);
+        w.write_f32(0.0);
+        // Surfing offset (x, y, z): unmodelled, zeroed.
+        w.write_f32(0.0);
+        w.write_f32(0.0);
+        w.write_f32(0.0);
+        w.write_u16(0); // surfing vehicle id
+                        // TODO(verify): the binary writes a fixed animation pair (animIndex=0x04A5, animFlags=0x8004);
+                        // we send a neutral 0/0 since OnFootSync does not model animation state.
+        w.write_u16(0); // animation index
+        w.write_u16(0); // animation flags
+        w.into_bytes()
+    }
 }
 
 /// A server→client coloured chat/system line (`RPC_ClientMessage` = 93). `text` is raw bytes in the
@@ -232,6 +383,41 @@ pub struct ServerMessage {
     pub text: Vec<u8>,
 }
 
+impl Packet for ServerMessage {
+    const ID: u8 = RpcId::ClientMessage as u8;
+}
+
+impl Decode for ServerMessage {
+    /// Decode `RPC_ClientMessage` (93): `[u32 colour LE][u32 len LE][text]`. Verified against Arizona
+    /// Bumble Bee live (`ffffffff 01000000 20` ⇒ white, len 1, `" "`).
+    ///
+    /// ```
+    /// use samp_proto::{Decode, ServerMessage};
+    /// let msg = ServerMessage::decode(&[0xff,0xff,0xff,0xff, 0x02,0,0,0, b'h', b'i']).unwrap();
+    /// assert_eq!(msg.color, 0xffff_ffff);
+    /// assert_eq!(msg.text, b"hi");
+    /// ```
+    fn decode(payload: &[u8]) -> Result<Self> {
+        let mut r = BitStreamReader::new(payload);
+        let color = r.read_u32()?;
+        let len = r.read_u32()? as usize;
+        let text = r.read_bytes(len)?;
+        Ok(ServerMessage { color, text })
+    }
+}
+
+impl Encode for ServerMessage {
+    /// Re-encode a `RPC_ClientMessage` (inverse of [`ServerMessage::decode`]) so the mock server can
+    /// send coloured lines: `[u32 colour LE][u32 len LE][text]`.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_u32(self.color);
+        w.write_u32(self.text.len() as u32);
+        w.write_bytes(&self.text);
+        w.into_bytes()
+    }
+}
+
 /// A server→client player chat broadcast (`RPC_Chat` = 101). `text` is raw bytes (see
 /// [`crate::decode_cp1251`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,48 +426,62 @@ pub struct ChatMessage {
     pub text: Vec<u8>,
 }
 
-/// Decode `RPC_ClientMessage` (93): `[u32 colour LE][u32 len LE][text]`. Verified against Arizona
-/// Bumble Bee live (`ffffffff 01000000 20` ⇒ white, len 1, `" "`).
-///
-/// ```
-/// use samp_proto::decode_client_message;
-/// let msg = decode_client_message(&[0xff,0xff,0xff,0xff, 0x02,0,0,0, b'h', b'i']).unwrap();
-/// assert_eq!(msg.color, 0xffff_ffff);
-/// assert_eq!(msg.text, b"hi");
-/// ```
-pub fn decode_client_message(payload: &[u8]) -> Result<ServerMessage> {
-    let mut r = BitStreamReader::new(payload);
-    let color = r.read_u32()?;
-    let len = r.read_u32()? as usize;
-    let text = r.read_bytes(len)?;
-    Ok(ServerMessage { color, text })
+impl Packet for ChatMessage {
+    const ID: u8 = RpcId::Chat as u8;
 }
 
-/// Decode a server→client `RPC_Chat` (101) broadcast: `[u16 playerId LE][u8 len][text]`.
-///
-/// ```
-/// use samp_proto::decode_player_chat;
-/// let msg = decode_player_chat(&[0x05, 0x00, 0x02, b'y', b'o']).unwrap();
-/// assert_eq!(msg.player_id.0, 5);
-/// assert_eq!(msg.text, b"yo");
-/// ```
-pub fn decode_player_chat(payload: &[u8]) -> Result<ChatMessage> {
-    let mut r = BitStreamReader::new(payload);
-    let player_id = PlayerId(r.read_u16()?);
-    let len = r.read_u8()? as usize;
-    let text = r.read_bytes(len)?;
-    Ok(ChatMessage { player_id, text })
+impl Decode for ChatMessage {
+    /// Decode a server→client `RPC_Chat` (101) broadcast: `[u16 playerId LE][u8 len][text]`.
+    ///
+    /// ```
+    /// use samp_proto::{ChatMessage, Decode};
+    /// let msg = ChatMessage::decode(&[0x05, 0x00, 0x02, b'y', b'o']).unwrap();
+    /// assert_eq!(msg.player_id.0, 5);
+    /// assert_eq!(msg.text, b"yo");
+    /// ```
+    fn decode(payload: &[u8]) -> Result<Self> {
+        let mut r = BitStreamReader::new(payload);
+        let player_id = PlayerId(r.read_u16()?);
+        let len = r.read_u8()? as usize;
+        let text = r.read_bytes(len)?;
+        Ok(ChatMessage { player_id, text })
+    }
 }
 
-/// Encode an outgoing `RPC_Chat` (101) — what the client sends when the local player types in the
-/// chat bar: `[u8 len][text]`. `text` is raw bytes in the server's encoding; the length is a single
-/// byte, so callers must keep messages ≤ 255 bytes (longer input is truncated).
-pub fn encode_chat(text: &[u8]) -> Vec<u8> {
-    let len = text.len().min(u8::MAX as usize);
-    let mut w = BitStreamWriter::new();
-    w.write_u8(len as u8);
-    w.write_bytes(&text[..len]);
-    w.into_bytes()
+impl Encode for ChatMessage {
+    /// Re-encode a player chat broadcast (inverse of [`ChatMessage::decode`]) so the mock server can
+    /// send it: `[u16 playerId LE][u8 len][text]`. The length is a single byte, so `text` is
+    /// truncated to 255 bytes.
+    fn encode(&self) -> Vec<u8> {
+        let len = self.text.len().min(u8::MAX as usize);
+        let mut w = BitStreamWriter::new();
+        w.write_u16(self.player_id.0);
+        w.write_u8(len as u8);
+        w.write_bytes(&self.text[..len]);
+        w.into_bytes()
+    }
+}
+
+/// An outgoing `RPC_Chat` (101) — what the client sends when the local player types in the chat bar:
+/// `[u8 len][text]`. `text` is raw bytes in the server's encoding; the length is a single byte, so
+/// callers must keep messages ≤ 255 bytes (longer input is truncated).
+#[derive(Debug, Clone)]
+pub struct ChatOutgoing<'a> {
+    pub text: &'a [u8],
+}
+
+impl Packet for ChatOutgoing<'_> {
+    const ID: u8 = RpcId::Chat as u8;
+}
+
+impl Encode for ChatOutgoing<'_> {
+    fn encode(&self) -> Vec<u8> {
+        let len = self.text.len().min(u8::MAX as usize);
+        let mut w = BitStreamWriter::new();
+        w.write_u8(len as u8);
+        w.write_bytes(&self.text[..len]);
+        w.into_bytes()
+    }
 }
 
 /// A server→client `ShowDialog` (61). `title`/`button1`/`button2` are raw bytes (cp1251). The body
@@ -296,22 +496,42 @@ pub struct ShowDialog {
     pub button2: Vec<u8>,
 }
 
-/// Decode the structural head of a `ShowDialog` (61): `[u16 dialogId][u8 style][str8 title]
-/// [str8 button1][str8 button2]…`. The trailing body string is left undecoded.
-pub fn decode_show_dialog(payload: &[u8]) -> Result<ShowDialog> {
-    let mut r = BitStreamReader::new(payload);
-    let dialog_id = r.read_u16()?;
-    let style = r.read_u8()?;
-    let title = read_str8_bytes(&mut r)?;
-    let button1 = read_str8_bytes(&mut r)?;
-    let button2 = read_str8_bytes(&mut r)?;
-    Ok(ShowDialog {
-        dialog_id,
-        style,
-        title,
-        button1,
-        button2,
-    })
+impl Packet for ShowDialog {
+    const ID: u8 = RpcId::ShowDialog as u8;
+}
+
+impl Decode for ShowDialog {
+    /// Decode the structural head of a `ShowDialog` (61): `[u16 dialogId][u8 style][str8 title]
+    /// [str8 button1][str8 button2]…`. The trailing body string is left undecoded.
+    fn decode(payload: &[u8]) -> Result<Self> {
+        let mut r = BitStreamReader::new(payload);
+        let dialog_id = r.read_u16()?;
+        let style = r.read_u8()?;
+        let title = read_str8_bytes(&mut r)?;
+        let button1 = read_str8_bytes(&mut r)?;
+        let button2 = read_str8_bytes(&mut r)?;
+        Ok(ShowDialog {
+            dialog_id,
+            style,
+            title,
+            button1,
+            button2,
+        })
+    }
+}
+
+impl Encode for ShowDialog {
+    /// Re-encode the structural head of a `ShowDialog` (inverse of [`ShowDialog::decode`]) so the
+    /// mock server can prompt a dialog. The undecoded trailing body is omitted (decode ignores it).
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_u16(self.dialog_id);
+        w.write_u8(self.style);
+        write_str8_bytes(&mut w, &self.title);
+        write_str8_bytes(&mut w, &self.button1);
+        write_str8_bytes(&mut w, &self.button2);
+        w.into_bytes()
+    }
 }
 
 fn read_str8_bytes(r: &mut BitStreamReader) -> Result<Vec<u8>> {
@@ -319,19 +539,53 @@ fn read_str8_bytes(r: &mut BitStreamReader) -> Result<Vec<u8>> {
     r.read_bytes(len)
 }
 
-/// Encode an outgoing `RPC_DialogResponse` (62): `[u16 dialogId][u8 button][u16 listItem][u8 len]
-/// [text]`. `button` is `1` for the positive/left button (login/OK), `0` for the right/cancel;
-/// `list_item` is the selected row (`0xFFFF` if none); `input` is the text-box content (e.g. the
-/// account password), truncated to 255 bytes.
-pub fn encode_dialog_response(dialog_id: u16, button: u8, list_item: u16, input: &[u8]) -> Vec<u8> {
-    let len = input.len().min(u8::MAX as usize);
-    let mut w = BitStreamWriter::new();
-    w.write_u16(dialog_id);
-    w.write_u8(button);
-    w.write_u16(list_item);
+fn write_str8_bytes(w: &mut BitStreamWriter, bytes: &[u8]) {
+    let len = bytes.len().min(u8::MAX as usize);
     w.write_u8(len as u8);
-    w.write_bytes(&input[..len]);
-    w.into_bytes()
+    w.write_bytes(&bytes[..len]);
+}
+
+/// An outgoing `RPC_DialogResponse` (62): `[u16 dialogId][u8 button][u16 listItem][u8 len][text]`.
+/// `button` is `1` for the positive/left button (login/OK), `0` for the right/cancel; `list_item`
+/// is the selected row (`0xFFFF` if none); `input` is the text-box content (e.g. the account
+/// password), truncated to 255 bytes.
+#[derive(Debug, Clone)]
+pub struct DialogResponse<'a> {
+    pub dialog_id: u16,
+    pub button: u8,
+    pub list_item: u16,
+    pub input: &'a [u8],
+}
+
+impl Packet for DialogResponse<'_> {
+    const ID: u8 = RpcId::DialogResponse as u8;
+}
+
+impl Encode for DialogResponse<'_> {
+    fn encode(&self) -> Vec<u8> {
+        let len = self.input.len().min(u8::MAX as usize);
+        let mut w = BitStreamWriter::new();
+        w.write_u16(self.dialog_id);
+        w.write_u8(self.button);
+        w.write_u16(self.list_item);
+        w.write_u8(len as u8);
+        w.write_bytes(&self.input[..len]);
+        w.into_bytes()
+    }
+}
+
+/// Read the assigned player id + server cookie from a `CONNECTION_REQUEST_ACCEPTED` body.
+///
+/// Verified against samp.dll sub_1000AA20: the body (after the RakNet id byte) is `[u32 external IP]
+/// [u16 port][u16 systemIndex][u32 cookie]`. The systemIndex is the assigned local player id; the
+/// cookie XORed with [`crate::CHALLENGE_XOR`] (0xFD9) becomes the `ClientJoin` challenge response.
+pub fn parse_connect(body: &[u8]) -> Result<(PlayerId, ServerCookie)> {
+    let mut reader = BitStreamReader::new(body);
+    let _ip = reader.read_u32()?;
+    let _port = reader.read_u16()?;
+    let player_id = PlayerId(reader.read_u16()?);
+    let cookie = ServerCookie(reader.read_u32()?);
+    Ok((player_id, cookie))
 }
 
 /// Best-effort gpci/auth token (`Key`). open.mp accepts any token whose value is divisible by

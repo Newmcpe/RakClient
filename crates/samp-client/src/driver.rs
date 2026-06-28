@@ -1,8 +1,9 @@
 //! The connection state machine.
 //!
-//! [`Driver`] is generic over a [`Transport`] and a [`Codec`] so it can be unit-tested against a
-//! scripted fake while production instantiates it with the real RakNet/`samp_proto` implementations.
-//! It is pumped one event at a time through [`Driver::next_event`], which internally `select!`s over
+//! [`Driver`] is generic over a [`Transport`] so it can be unit-tested against a scripted fake while
+//! production instantiates it with the real RakNet transport. Packet bodies are encoded/decoded
+//! through the [`samp_proto::Encode`]/[`samp_proto::Decode`] traits on each packet struct. It is
+//! pumped one event at a time through [`Driver::next_event`], which internally `select!`s over
 //! incoming transport events, the on-foot sync interval (while `Spawned`), and the reconnect timer.
 
 use std::collections::VecDeque;
@@ -12,14 +13,15 @@ use std::time::{Duration, Instant};
 
 use raknet::{DisconnectReason, RakEvent, Reliability};
 use samp_proto::{
-    ClientJoin, Direction, OnFootSync, OutboundMsg, PlayerId, Quaternion, RpcId, SyncPacketId,
-    Vector3, Verdict, WeaponId, CHALLENGE_XOR, SAMP_VERSION_0_3_7,
+    ChatMessage, ChatOutgoing, ClientJoin, Decode, Direction, Encode, InitGame, OnFootSync,
+    OutboundMsg, PlayerId, Quaternion, RequestClass, RequestClassResponse, RequestSpawn,
+    RequestSpawnResponse, RpcId, ServerMessage, Spawn, SpectatorSync, SyncPacketId, Vector3,
+    Verdict, WeaponId, CHALLENGE_XOR, SAMP_VERSION_0_3_7,
 };
 use tokio::time::{self, Interval, MissedTickBehavior, Sleep};
 
 use crate::aim::AimSync;
 use crate::client_emulation::ClientEmulation;
-use crate::codec::Codec;
 use crate::registry::PacketRegistry;
 use crate::state::SharedLocalPlayer;
 use crate::transport::Transport;
@@ -28,12 +30,21 @@ use crate::{ClientConfig, ClientEvent, ConnectionState};
 /// How often the registry's `on_update` handlers fire while connected (drives script timers).
 const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// When the bot's on-foot state is unchanged, resend a keepalive sync at most this often instead of
+/// every `sync_interval` tick — a stationary bridge bot barely moves, so this cuts steady-state CPU
+/// and bandwidth while still proving liveness to the server.
+const IDLE_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
 const RPC_INIT_GAME: u8 = RpcId::InitGame as u8;
 const RPC_REQUEST_CLASS: u8 = RpcId::RequestClass as u8;
 const RPC_REQUEST_SPAWN: u8 = RpcId::RequestSpawn as u8;
 const RPC_CONNECTION_REJECTED: u8 = RpcId::ConnectionRejected as u8;
 const RPC_CLIENT_MESSAGE: u8 = RpcId::ClientMessage as u8;
 const RPC_CHAT: u8 = RpcId::Chat as u8;
+/// `RPC_ScrToggleSpectating` (124, 0x7C). The server sends `toggle=1` to put us in spectate and
+/// `toggle=0` to drop us out — at which point RakSAMP Lite (`sub_45B260`) calls `Net_Spawn`. This is
+/// the Arizona post-login spawn trigger.
+const RPC_TOGGLE_SPECTATING: u8 = 124;
 
 const SPAWN_HEALTH: u8 = 100;
 
@@ -45,14 +56,17 @@ enum Step {
     Update,
 }
 
-pub(crate) struct Driver<T: Transport, C: Codec> {
+pub(crate) struct Driver<T: Transport> {
     config: ClientConfig,
     transport: T,
-    codec: C,
     state: ConnectionState,
     pending: VecDeque<ClientEvent>,
     local_id: PlayerId,
     sync: OnFootSync,
+    /// The last on-foot sync actually sent, and when — drives adaptive sending (only resend on a
+    /// state change, otherwise at the slow idle keepalive cadence).
+    last_sync: OnFootSync,
+    last_sync_at: Option<Instant>,
     sync_timer: Option<Interval>,
     reconnect_timer: Option<Pin<Box<Sleep>>>,
     closed: bool,
@@ -67,10 +81,23 @@ pub(crate) struct Driver<T: Transport, C: Codec> {
     /// Standard-client emulation: ClientCheck answers, weapon inventory, score-ping, vehicle
     /// ownership (always on; acts once a shared bot state is attached).
     emulation: ClientEmulation,
+    /// True between join and spawn: we spectate (sending spectator sync) until the server drives the
+    /// spawn via `RequestSpawnResponse(allow==2)`, or the script calls `sampSpawnPlayer()`.
+    spectating: bool,
+    /// Mirrors RakSAMP Lite's `g_bSpawnRequested`: set when we send `RequestSpawn` (via
+    /// `sampSpawnPlayer()`), so a non-2 `RequestSpawnResponse` allow still spawns us.
+    spawn_requested: bool,
+    /// Mirrors RakSAMP Lite's `g_bSpectating`: the last `TogglePlayerSpectating` value from the server.
+    /// A `1 → 0` transition is the server dropping us out of spectate → spawn (the Arizona trigger).
+    server_spectating: bool,
+    /// Set when a login `DialogResponse` is sent while spectating; the pump loop then spawns. This is
+    /// the order the real client uses (login dialog answered → spawn), deferred to avoid recursing
+    /// through `send_rpc`.
+    spawn_after_login: bool,
 }
 
-impl<T: Transport, C: Codec> Driver<T, C> {
-    pub(crate) fn new(config: ClientConfig, transport: T, codec: C) -> Self {
+impl<T: Transport> Driver<T> {
+    pub(crate) fn new(config: ClientConfig, transport: T) -> Self {
         let mut pending = VecDeque::new();
         pending.push_back(ClientEvent::StateChanged(ConnectionState::Connecting));
         let seed = std::time::SystemTime::now()
@@ -82,11 +109,12 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         Self {
             config,
             transport,
-            codec,
             state: ConnectionState::Connecting,
             pending,
             local_id: PlayerId::default(),
             sync: OnFootSync::default(),
+            last_sync: OnFootSync::default(),
+            last_sync_at: None,
             sync_timer: None,
             reconnect_timer: None,
             closed: false,
@@ -95,6 +123,10 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             bot_state: None,
             aim,
             emulation,
+            spectating: false,
+            spawn_requested: false,
+            server_spectating: false,
+            spawn_after_login: false,
         }
     }
 
@@ -144,12 +176,17 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             match self.step().await {
                 Step::Event(Some(event)) => self.on_rak_event(event).await,
                 Step::Event(None) => self.on_transport_closed(),
-                Step::SyncTick => self.on_sync_tick().await,
+                Step::SyncTick => self.on_sync_tick(false).await,
                 Step::Reconnect => self.on_reconnect().await,
                 Step::Update => self.registry.tick(),
             }
             self.flush_outbox().await;
             self.poll_bot_actions().await;
+            if self.spawn_after_login && !matches!(self.state, ConnectionState::Spawned) {
+                self.spawn_after_login = false;
+                self.spectating = false;
+                self.enter_spawned().await;
+            }
         }
     }
 
@@ -174,11 +211,35 @@ impl<T: Transport, C: Codec> Driver<T, C> {
                         Verdict::Pass => data,
                         Verdict::Rewrite(bytes) => bytes,
                     };
+                    if id == 220 {
+                        tracing::debug!(
+                            sub_id = data.get(1).copied().unwrap_or(0),
+                            channel,
+                            reliability,
+                            payload = %data.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                            "outbound 220",
+                        );
+                    }
                     self.transport
                         .send(data, reliability_from_wire(reliability), channel)
                         .await
                 }
-                OutboundMsg::Rpc { id, payload } => self.transport.rpc(id, payload).await,
+                OutboundMsg::Rpc { id, payload } => {
+                    tracing::debug!(
+                        rpc_id = id,
+                        payload = %payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "outbound RPC",
+                    );
+                    // A script answering the login dialog (`sampSendDialogResponse`) while we spectate
+                    // → spawn next, the order the real client uses (login answered → spawn).
+                    if self.spectating
+                        && id == RpcId::DialogResponse as u8
+                        && !matches!(self.state, ConnectionState::Spawned)
+                    {
+                        self.spawn_after_login = true;
+                    }
+                    self.transport.rpc(id, payload).await
+                }
             };
             if let Err(error) = result {
                 tracing::warn!(%error, "failed to send script-queued message");
@@ -223,15 +284,27 @@ impl<T: Transport, C: Codec> Driver<T, C> {
 
     /// Act on `updateSync()` / `reconnect(ms)` flags scripts set on the bot state.
     async fn poll_bot_actions(&mut self) {
-        let (force_sync, reconnect_in) = match &self.bot_state {
+        let (force_sync, reconnect_in, spawn_requested) = match &self.bot_state {
             Some(state) => {
                 let mut s = state.borrow_mut();
-                (std::mem::take(&mut s.force_sync), s.reconnect_in_ms.take())
+                (
+                    std::mem::take(&mut s.force_sync),
+                    s.reconnect_in_ms.take(),
+                    std::mem::take(&mut s.spawn_requested),
+                )
             }
             None => return,
         };
+        // `sampSpawnPlayer()` — explicit spawn request (RakSAMP Lite's "reqspawn"). Usually NOT needed
+        // (the server drives the spawn via RequestSpawnResponse(allow==2) after login); this is the
+        // manual override. Sets `spawn_requested` so a non-2 allow still spawns us.
+        if spawn_requested && self.spectating {
+            self.spawn_requested = true;
+            let payload = RequestSpawn.encode();
+            self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
+        }
         if force_sync && matches!(self.state, ConnectionState::Spawned) {
-            self.on_sync_tick().await;
+            self.on_sync_tick(true).await;
         }
         if let Some(ms) = reconnect_in {
             self.transition(ConnectionState::Disconnected);
@@ -244,6 +317,8 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     async fn step(&mut self) -> Step {
         let closed = self.closed;
         let spawned = matches!(self.state, ConnectionState::Spawned);
+        // Arizona pre-spawn spectating also drives the sync tick (to send spectator sync).
+        let ticking = spawned || self.spectating;
         let has_reconnect = self.reconnect_timer.is_some();
         let has_sync = self.sync_timer.is_some();
         let has_update = self.update_timer.is_some();
@@ -257,7 +332,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         tokio::select! {
             biased;
             _ = poll_sleep(reconnect_timer), if has_reconnect => Step::Reconnect,
-            _ = poll_interval(sync_timer), if spawned && has_sync => Step::SyncTick,
+            _ = poll_interval(sync_timer), if ticking && has_sync => Step::SyncTick,
             _ = poll_interval(update_timer), if has_update => Step::Update,
             event = transport.recv(), if !closed => Step::Event(event),
         }
@@ -273,7 +348,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     async fn on_connected(&mut self, body: &[u8]) {
-        let (player_id, cookie) = match self.codec.parse_connect(body) {
+        let (player_id, cookie) = match samp_proto::parse_connect(body) {
             Ok(parsed) => parsed,
             Err(error) => {
                 tracing::warn!(%error, "failed to parse connect body");
@@ -287,7 +362,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             .config
             .gpci
             .clone()
-            .unwrap_or_else(|| self.codec.generate_gpci());
+            .unwrap_or_else(samp_proto::generate_gpci);
         let payload = {
             let join = ClientJoin {
                 version: SAMP_VERSION_0_3_7,
@@ -301,7 +376,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
                 // Vanilla servers ignore the trailing bytes, so this is safe.
                 duplicate_challenge_response: self.bot_state.is_some(),
             };
-            self.codec.encode_client_join(&join)
+            join.encode()
         };
         self.transition(ConnectionState::RakNetConnected);
         self.pending.push_back(ClientEvent::Connected);
@@ -314,6 +389,10 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     async fn on_rpc(&mut self, id: u8, payload: &[u8]) {
+        tracing::debug!(rpc_id = id, len = payload.len(), state = ?self.state, "inbound RPC");
+        if let Some(decoded) = decode_inbound_rpc(id, payload) {
+            tracing::debug!(target: "samp_client::driver", "  └─ {decoded}");
+        }
         // Registered handlers (scripts/observers) see the RPC first: a Drop consumes it before the
         // FSM, a Rewrite swaps the body the FSM then processes.
         let rewritten;
@@ -333,12 +412,17 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             (RPC_REQUEST_CLASS, ConnectionState::ClassSelection) => {
                 self.on_class_response(payload).await
             }
-            (RPC_REQUEST_SPAWN, ConnectionState::SpawnRequested) => {
-                self.on_spawn_response(payload).await
-            }
+            // The server drives the spawn with `RequestSpawnResponse` while we're spectating
+            // (ClassSelection/ClassSelected), or it answers an explicit `sampSpawnPlayer()` RequestSpawn.
+            (
+                RPC_REQUEST_SPAWN,
+                ConnectionState::ClassSelection | ConnectionState::ClassSelected,
+            ) => self.on_spawn_response(payload).await,
+            (RPC_TOGGLE_SPECTATING, _) => self.on_toggle_spectating(payload).await,
             (RPC_CONNECTION_REJECTED, _) => self.on_disconnect(DisconnectReason::Rejected),
             (RPC_CLIENT_MESSAGE, _) => self.on_client_message(payload),
             (RPC_CHAT, _) => self.on_player_chat(payload),
+            (crate::type3::RPC_TYPE3_CHALLENGE, _) => self.on_type3(payload).await,
             _ => {}
         }
     }
@@ -450,6 +534,14 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         let Some(&id) = data.first() else {
             return;
         };
+        tracing::debug!(packet_id = id, len = data.len(), "inbound packet");
+        if id == 220 {
+            tracing::debug!(
+                sub_id = data.get(1).copied().unwrap_or(0),
+                payload = %data.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "inbound 220",
+            );
+        }
         if id == SyncPacketId::VehicleSync as u8 {
             let hijack = self
                 .bot_state
@@ -466,8 +558,31 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         let _ = self.registry.dispatch_packet(Direction::Incoming, id, data);
     }
 
+    /// Answer the Arizona type-3 anti-cheat attestation (inbound RPC 186) with the HMAC over the
+    /// requested static `core.asi` resource regions, replied as RPC 187. See [`crate::type3`].
+    async fn on_type3(&mut self, payload: &[u8]) {
+        match crate::type3::respond(payload) {
+            Some(resp) => {
+                if let Err(error) = self
+                    .transport
+                    .rpc(crate::type3::RPC_TYPE3_RESPONSE, resp)
+                    .await
+                {
+                    tracing::warn!(%error, "failed to send type-3 attestation response");
+                } else {
+                    tracing::debug!("answered type-3 attestation (RPC 186→187)");
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "type-3 challenge not statically answerable (live-memory or unknown resource)"
+                )
+            }
+        }
+    }
+
     fn on_client_message(&mut self, payload: &[u8]) {
-        match self.codec.decode_client_message(payload) {
+        match ServerMessage::decode(payload) {
             Ok(msg) => self.pending.push_back(ClientEvent::ServerMessage {
                 color: msg.color,
                 text: samp_proto::decode_cp1251(&msg.text),
@@ -477,7 +592,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     fn on_player_chat(&mut self, payload: &[u8]) {
-        match self.codec.decode_player_chat(payload) {
+        match ChatMessage::decode(payload) {
             Ok(msg) => self.pending.push_back(ClientEvent::Chat {
                 player_id: msg.player_id,
                 text: samp_proto::decode_cp1251(&msg.text),
@@ -487,7 +602,7 @@ impl<T: Transport, C: Codec> Driver<T, C> {
     }
 
     async fn on_init_game(&mut self, payload: &[u8]) {
-        let init = match self.codec.decode_init_game(payload) {
+        let init = match InitGame::decode(payload) {
             Ok(init) => init,
             Err(error) => {
                 tracing::warn!(%error, "failed to decode init game");
@@ -512,14 +627,21 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         self.request_spawn_class().await;
     }
 
+    /// After join, request a class and spectate. Like RakSAMP Lite (`RPC_InitGame → RequestClass`) we
+    /// do NOT request spawn here — the server drives the spawn via `RequestSpawnResponse(allow==2)`
+    /// (or the script calls `sampSpawnPlayer()`). Until then we send spectator sync.
     async fn request_spawn_class(&mut self) {
-        let payload = self.codec.encode_request_class(self.config.default_class);
+        let payload = RequestClass {
+            class: self.config.default_class,
+        }
+        .encode();
         self.send_rpc(RpcId::RequestClass as u8, payload).await;
+        self.spectating = true;
         self.transition(ConnectionState::ClassSelection);
     }
 
     async fn on_class_response(&mut self, payload: &[u8]) {
-        let response = match self.codec.decode_request_class_response(payload) {
+        let response = match RequestClassResponse::decode(payload) {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(%error, "failed to decode class response");
@@ -530,27 +652,55 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             self.sync.position = response.spawn_position;
             self.mirror_to_state();
         }
+        // Like RakSAMP Lite, do NOT auto-request spawn — keep spectating and let the server drive the
+        // spawn via `RequestSpawnResponse(allow==2)` (it sends that after login on Arizona). Requesting
+        // spawn here would prompt an early allow and spawn us before login → "ОШИБКА 7721".
         self.transition(ConnectionState::ClassSelected);
-        let payload = self.codec.encode_request_spawn();
-        self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
-        self.transition(ConnectionState::SpawnRequested);
     }
 
     async fn on_spawn_response(&mut self, payload: &[u8]) {
-        let response = match self.codec.decode_request_spawn_response(payload) {
+        let response = match RequestSpawnResponse::decode(payload) {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(%error, "failed to decode spawn response");
                 return;
             }
         };
-        // `allow != 0` while a spawn was requested is the server letting us spawn (it is `2` on the
-        // normal path). `0` means "not yet" — stay in `SpawnRequested` and wait.
-        if response.allow == 0 {
-            tracing::debug!("server has not authorised spawn yet");
+        // RakSAMP Lite's RPC_RequestSpawnResponse condition (0x45ace0): spawn when `allow == 2`, or
+        // when `allow != 0` while we explicitly requested spawn. On Arizona the server sends
+        // `allow == 2` after login — so this is the server-driven spawn, no explicit client call.
+        let allow = response.allow;
+        if allow != 2 && !(allow != 0 && self.spawn_requested) {
+            tracing::debug!(allow, "server has not authorised spawn yet");
             return;
         }
-        let payload = self.codec.encode_spawn();
+        self.spectating = false;
+        self.spawn_requested = false;
+        self.enter_spawned().await;
+    }
+
+    /// `TogglePlayerSpectating` (RPC 124): the Arizona server toggles spectate ON during login and
+    /// OFF afterwards. A `1 → 0` transition means "drop out of spectate" → spawn, exactly like
+    /// RakSAMP Lite's `sub_45B260 → Net_Spawn`. This is the server-driven spawn, no explicit call.
+    async fn on_toggle_spectating(&mut self, payload: &[u8]) {
+        let toggle = payload.iter().take(4).any(|&b| b != 0);
+        let was_spectating = self.server_spectating;
+        self.server_spectating = toggle;
+        if was_spectating && !toggle && !matches!(self.state, ConnectionState::Spawned) {
+            self.spectating = false;
+            self.enter_spawned().await;
+        }
+    }
+
+    /// Send `RPC_Spawn` and enter the `Spawned` state — the single convergence point for every spawn
+    /// trigger. We spectate (spectator-sync 212) after join until one of these fires:
+    /// - PRIMARY: the login `DialogResponse` (RPC 62) sent while spectating sets `spawn_after_login`,
+    ///   and the `next_event` pump then calls here (the order the real Arizona client uses).
+    /// - FALLBACK: `TogglePlayerSpectating` (RPC 124) on a `1 → 0` transition (`on_toggle_spectating`),
+    ///   or `RequestSpawnResponse(allow==2)` (`on_spawn_response`) — these cover non-Arizona servers.
+    /// - MANUAL: `sampSpawnPlayer()` sends `RequestSpawn`, whose response then spawns us.
+    async fn enter_spawned(&mut self) {
+        let payload = Spawn.encode();
         self.send_rpc(RpcId::Spawn as u8, payload).await;
         self.sync.health = SPAWN_HEALTH;
         self.sync.quaternion = Quaternion {
@@ -571,6 +721,30 @@ impl<T: Transport, C: Codec> Driver<T, C> {
         self.pending.push_back(ClientEvent::Spawned);
     }
 
+    /// Arizona connect flow (RakSAMP Lite model): after join send the entity-streamer init RPC and
+    /// `RequestClass`, then spectate (spectator sync via the sync tick). We do NOT send `RequestSpawn`
+    /// — the server drives the spawn by sending `RequestSpawnResponse(allow==2)` after login, exactly
+    /// like RakSAMP Lite's `RPC_InitGame → RequestClass … RPC_RequestSpawnResponse → Net_Spawn`.
+    /// Spawning before login earns "ОШИБКА 7721", so the spawn must be server-driven (or via an
+    /// Send a spectator-sync packet (212) — the pre-spawn keepalive while spectating.
+    async fn send_spectator_sync(&mut self) {
+        let body = SpectatorSync {
+            position: self.sync.position,
+        }
+        .encode();
+        let mut packet = Vec::with_capacity(body.len() + 1);
+        packet.push(SyncPacketId::SpectatorSync as u8);
+        packet.extend_from_slice(&body);
+        if let Err(error) = self
+            .transport
+            .send(packet, Reliability::UnreliableSequenced, 0)
+            .await
+        {
+            tracing::warn!(%error, "failed to send spectator sync");
+            self.on_disconnect(DisconnectReason::ConnectionLost);
+        }
+    }
+
     /// Whether the bot is currently in a vehicle (from the shared local-player state).
     fn in_vehicle(&self) -> bool {
         self.bot_state
@@ -578,7 +752,16 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             .is_some_and(|s| s.borrow().in_vehicle())
     }
 
-    async fn on_sync_tick(&mut self) {
+    /// One sync cycle. The on-foot packet is sent adaptively — on any state change, on a forced
+    /// sync (`updateSync()`), or otherwise only at the [`IDLE_SYNC_INTERVAL`] keepalive cadence — so
+    /// a stationary bot stops flooding identical packets. Aim and weapon-inventory sends keep their
+    /// own cadences and run every cycle.
+    async fn on_sync_tick(&mut self, force: bool) {
+        // Arizona pre-spawn: spectate (keepalive) while awaiting the login dialog, not on-foot sync.
+        if self.spectating && !matches!(self.state, ConnectionState::Spawned) {
+            self.send_spectator_sync().await;
+            return;
+        }
         self.mirror_from_state();
         // Emulation: report the held weapon and the occasional score-ping key blip.
         if let Some(state) = self.bot_state.as_ref() {
@@ -588,28 +771,40 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             self.sync.weapon = WeaponId(weapon);
             self.sync.keys = keys;
         }
-        let body = self.codec.encode_on_foot_sync(&self.sync);
-        let mut packet = Vec::with_capacity(body.len() + 1);
-        packet.push(SyncPacketId::PlayerSync as u8);
-        packet.extend_from_slice(&body);
-        // The sync packet passes through `onSendPacket` so scripts (e.g. aim-fix) can edit/drop it.
-        let packet = match self.registry.dispatch_packet(
-            Direction::Outgoing,
-            SyncPacketId::PlayerSync as u8,
-            &packet,
-        ) {
-            Verdict::Drop => return,
-            Verdict::Pass => packet,
-            Verdict::Rewrite(bytes) => bytes,
-        };
-        if let Err(error) = self
-            .transport
-            .send(packet, Reliability::UnreliableSequenced, 0)
-            .await
-        {
-            tracing::warn!(%error, "failed to send on-foot sync");
-            self.on_disconnect(DisconnectReason::ConnectionLost);
-            return;
+        let now = Instant::now();
+        let due = force
+            || self.sync != self.last_sync
+            || self
+                .last_sync_at
+                .is_none_or(|at| now.duration_since(at) >= IDLE_SYNC_INTERVAL);
+        if due {
+            let body = self.sync.encode();
+            let mut packet = Vec::with_capacity(body.len() + 1);
+            packet.push(SyncPacketId::PlayerSync as u8);
+            packet.extend_from_slice(&body);
+            // The sync packet passes through `onSendPacket` so scripts (e.g. aim-fix) can edit/drop it.
+            let to_send = match self.registry.dispatch_packet(
+                Direction::Outgoing,
+                SyncPacketId::PlayerSync as u8,
+                &packet,
+            ) {
+                Verdict::Drop => None,
+                Verdict::Pass => Some(packet),
+                Verdict::Rewrite(bytes) => Some(bytes),
+            };
+            if let Some(packet) = to_send {
+                if let Err(error) = self
+                    .transport
+                    .send(packet, Reliability::UnreliableSequenced, 0)
+                    .await
+                {
+                    tracing::warn!(%error, "failed to send on-foot sync");
+                    self.on_disconnect(DisconnectReason::ConnectionLost);
+                    return;
+                }
+                self.last_sync = self.sync;
+                self.last_sync_at = Some(now);
+            }
         }
         // Emulation: stream the weapon inventory periodically.
         let weapons_msg = if let Some(state) = self.bot_state.as_ref() {
@@ -652,6 +847,8 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             Ok(()) => {
                 self.local_id = PlayerId::default();
                 self.sync = OnFootSync::default();
+                self.last_sync = OnFootSync::default();
+                self.last_sync_at = None;
                 self.transition(ConnectionState::Connecting);
             }
             Err(error) => {
@@ -696,18 +893,29 @@ impl<T: Transport, C: Codec> Driver<T, C> {
             tracing::warn!(rpc_id, %error, "failed to send rpc");
             self.on_disconnect(DisconnectReason::ConnectionLost);
         }
+        // The login dialog was just answered while spectating → spawn next, the order the real client
+        // uses (deferred to the pump loop to avoid recursing through `send_rpc`).
+        if !self.closed
+            && self.spectating
+            && rpc_id == RpcId::DialogResponse as u8
+            && !matches!(self.state, ConnectionState::Spawned)
+        {
+            self.spawn_after_login = true;
+        }
     }
 
     /// Send a chat line as the local player (`RPC_Chat`, client→server `[u8 len][text]`). `text` is
     /// raw bytes in the server's encoding (cp1251 for Arizona); callers transcode before calling.
     pub(crate) async fn send_chat(&mut self, text: &[u8]) {
-        let payload = self.codec.encode_chat(text);
+        let payload = ChatOutgoing { text }.encode();
         self.send_rpc(RpcId::Chat as u8, payload).await;
     }
 
     fn transition(&mut self, next: ConnectionState) {
         self.state = next.clone();
-        if matches!(self.state, ConnectionState::Spawned) {
+        // Arm the sync tick while Spawned (on-foot sync) OR during the Arizona pre-spawn spectate
+        // phase (spectator sync keepalive while waiting for the server to drive the spawn).
+        if matches!(self.state, ConnectionState::Spawned) || self.spectating {
             if self.sync_timer.is_none() {
                 let period = self.config.sync_interval.max(Duration::from_millis(1));
                 let mut interval = time::interval(period);
@@ -771,6 +979,51 @@ fn decode_interpolate_dest(payload: &[u8]) -> Option<Vector3> {
     }
 }
 
+/// Decode an inbound RPC body into a human-readable struct for logging — turns the raw bytes into
+/// named fields (cp1251 text rendered as strings). Covers the dialog/chat specials plus everything in
+/// the typed incoming registry; returns `None` for ids with no decoder.
+fn decode_inbound_rpc(id: u8, payload: &[u8]) -> Option<String> {
+    use samp_proto::events::FieldValue as F;
+    match id {
+        61 => samp_proto::ShowDialog::decode(payload).ok().map(|d| {
+            format!(
+                "ShowDialog {{ dialog_id: {}, style: {}, title: {:?}, button1: {:?}, button2: {:?} }}",
+                d.dialog_id,
+                d.style,
+                samp_proto::decode_cp1251(&d.title),
+                samp_proto::decode_cp1251(&d.button1),
+                samp_proto::decode_cp1251(&d.button2),
+            )
+        }),
+        93 => samp_proto::ServerMessage::decode(payload).ok().map(|m| {
+            format!(
+                "ClientMessage {{ color: {:08X}, text: {:?} }}",
+                m.color,
+                samp_proto::decode_cp1251(&m.text)
+            )
+        }),
+        101 => samp_proto::ChatMessage::decode(payload).ok().map(|m| {
+            format!(
+                "Chat {{ player_id: {}, text: {:?} }}",
+                m.player_id.0,
+                samp_proto::decode_cp1251(&m.text)
+            )
+        }),
+        _ => {
+            let (name, fields) = samp_proto::events::decode_incoming(id, payload)?.ok()?;
+            let body = fields
+                .iter()
+                .map(|f| match f {
+                    F::Bytes(b) => format!("{:?}", samp_proto::decode_cp1251(b)),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{name} {{ {body} }}"))
+        }
+    }
+}
+
 /// Map a RakNet wire reliability value (`0..=4`, as carried in [`OutboundMsg::Packet`]) to the
 /// transport's [`Reliability`]. Unknown values fall back to reliable-ordered.
 fn reliability_from_wire(value: u8) -> Reliability {
@@ -804,8 +1057,6 @@ mod tests {
 
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
-
-    use samp_proto::{InitGame, RequestClassResponse, RequestSpawnResponse, ServerCookie, Vector3};
 
     #[derive(Default)]
     struct TransportLog {
@@ -887,80 +1138,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct FakeCodec {
-        connect: (PlayerId, ServerCookie),
-        init: InitGame,
-        class_response: RequestClassResponse,
-        spawn_response: RequestSpawnResponse,
-    }
-
-    impl Codec for FakeCodec {
-        fn parse_connect(&self, _body: &[u8]) -> samp_proto::Result<(PlayerId, ServerCookie)> {
-            Ok(self.connect)
-        }
-
-        fn encode_client_join(&self, _join: &ClientJoin<'_>) -> Vec<u8> {
-            Vec::new()
-        }
-
-        fn decode_init_game(&self, _payload: &[u8]) -> samp_proto::Result<InitGame> {
-            Ok(self.init.clone())
-        }
-
-        fn encode_request_class(&self, _class: samp_proto::ClassId) -> Vec<u8> {
-            Vec::new()
-        }
-
-        fn decode_request_class_response(
-            &self,
-            _payload: &[u8],
-        ) -> samp_proto::Result<RequestClassResponse> {
-            Ok(self.class_response.clone())
-        }
-
-        fn encode_request_spawn(&self) -> Vec<u8> {
-            Vec::new()
-        }
-
-        fn decode_request_spawn_response(
-            &self,
-            _payload: &[u8],
-        ) -> samp_proto::Result<RequestSpawnResponse> {
-            Ok(self.spawn_response)
-        }
-
-        fn encode_spawn(&self) -> Vec<u8> {
-            Vec::new()
-        }
-
-        fn encode_on_foot_sync(&self, _sync: &OnFootSync) -> Vec<u8> {
-            vec![0xAA, 0xBB]
-        }
-
-        fn decode_client_message(
-            &self,
-            payload: &[u8],
-        ) -> samp_proto::Result<samp_proto::ServerMessage> {
-            samp_proto::decode_client_message(payload)
-        }
-
-        fn decode_player_chat(
-            &self,
-            payload: &[u8],
-        ) -> samp_proto::Result<samp_proto::ChatMessage> {
-            samp_proto::decode_player_chat(payload)
-        }
-
-        fn encode_chat(&self, text: &[u8]) -> Vec<u8> {
-            samp_proto::encode_chat(text)
-        }
-
-        fn generate_gpci(&self) -> String {
-            "TESTGPCI".to_string()
-        }
-    }
-
     fn test_config() -> ClientConfig {
         ClientConfig::builder(
             "127.0.0.1:7777".parse::<SocketAddr>().expect("addr"),
@@ -971,40 +1148,42 @@ mod tests {
         .build()
     }
 
-    fn happy_codec() -> FakeCodec {
-        FakeCodec {
-            connect: (PlayerId(7), ServerCookie(0x1234)),
-            init: InitGame {
-                local_player_id: PlayerId(42),
-                host_name: "Test Server".to_string(),
-            },
-            class_response: RequestClassResponse {
-                allowed: true,
-                spawn_position: Vector3 {
-                    x: 1.0,
-                    y: 2.0,
-                    z: 3.0,
-                },
-                ..RequestClassResponse::default()
-            },
-            spawn_response: RequestSpawnResponse { allow: 2 },
-        }
+    /// A `CONNECTION_REQUEST_ACCEPTED` body the real [`samp_proto::parse_connect`] accepts (12 bytes:
+    /// `[u32 ip][u16 port][u16 playerId][u32 cookie]`). The values are irrelevant to the assertions —
+    /// the player id is overwritten by `InitGame` and the cookie only feeds the (unsent-here) join.
+    fn connect_body() -> Vec<u8> {
+        vec![0u8; 12]
     }
 
     fn happy_script() -> Vec<RakEvent> {
         vec![
-            RakEvent::Connected { body: Vec::new() },
+            RakEvent::Connected {
+                body: connect_body(),
+            },
             RakEvent::Rpc {
                 id: RPC_INIT_GAME,
-                payload: Vec::new(),
+                payload: InitGame {
+                    local_player_id: PlayerId(42),
+                    host_name: "Test Server".to_string(),
+                }
+                .encode(),
             },
             RakEvent::Rpc {
                 id: RPC_REQUEST_CLASS,
-                payload: Vec::new(),
+                payload: RequestClassResponse {
+                    allowed: true,
+                    spawn_position: Vector3 {
+                        x: 1.0,
+                        y: 2.0,
+                        z: 3.0,
+                    },
+                    ..RequestClassResponse::default()
+                }
+                .encode(),
             },
             RakEvent::Rpc {
                 id: RPC_REQUEST_SPAWN,
-                payload: Vec::new(),
+                payload: RequestSpawnResponse { allow: 2 }.encode(),
             },
         ]
     }
@@ -1012,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn reaches_spawned_emitting_events_in_order() {
         let (transport, log) = ScriptedTransport::new(happy_script(), false);
-        let mut driver = Driver::new(test_config(), transport, happy_codec());
+        let mut driver = Driver::new(test_config(), transport);
 
         let mut milestones = Vec::new();
         while let Some(event) = driver.next_event().await {
@@ -1040,12 +1219,13 @@ mod tests {
         assert_eq!(driver.state(), &ConnectionState::Spawned);
 
         let log = log.lock().expect("log poisoned");
+        // Server-driven spawn (RakSAMP Lite model): we send ClientJoin + RequestClass, then the
+        // server's RequestSpawnResponse(allow==2) makes us send Spawn. We never send RequestSpawn.
         assert_eq!(
             log.rpc_ids(),
             vec![
                 RpcId::ClientJoin as u8,
                 RpcId::RequestClass as u8,
-                RpcId::RequestSpawn as u8,
                 RpcId::Spawn as u8,
             ]
         );
@@ -1057,7 +1237,7 @@ mod tests {
             vec![RakEvent::Disconnected(DisconnectReason::InvalidPassword)],
             false,
         );
-        let mut driver = Driver::new(test_config(), transport, FakeCodec::default());
+        let mut driver = Driver::new(test_config(), transport);
 
         let mut disconnect_message = None;
         while let Some(event) = driver.next_event().await {
@@ -1085,7 +1265,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn connection_lost_without_event_still_reconnects() {
         let (transport, _log) = ScriptedTransport::new(Vec::new(), false);
-        let mut driver = Driver::new(test_config(), transport, FakeCodec::default());
+        let mut driver = Driver::new(test_config(), transport);
 
         // Drain the initial `Connecting` state event, then the transport closes silently.
         let mut saw_disconnect = false;
@@ -1106,8 +1286,7 @@ mod tests {
         let (transport, _log) = ScriptedTransport::new(Vec::new(), false);
         let state =
             crate::state::LocalPlayer::shared("Bot".to_string(), "127.0.0.1:7777".parse().unwrap());
-        let mut driver = Driver::new(test_config(), transport, FakeCodec::default())
-            .with_bot_state(state.clone());
+        let mut driver = Driver::new(test_config(), transport).with_bot_state(state.clone());
 
         // GivePlayerMoney (18) is additive; ResetPlayerMoney (20) zeroes.
         driver.track_state(18, &500i32.to_le_bytes());
@@ -1123,10 +1302,34 @@ mod tests {
         assert!(state.borrow().vehicle.is_none());
     }
 
+    #[tokio::test]
+    async fn on_foot_sync_is_adaptive() {
+        let (transport, log) = ScriptedTransport::new(Vec::new(), false);
+        let state =
+            crate::state::LocalPlayer::shared("Bot".to_string(), "127.0.0.1:7777".parse().unwrap());
+        let mut driver = Driver::new(test_config(), transport).with_bot_state(state.clone());
+
+        let sync_count = || log.lock().expect("log poisoned").sync_count();
+
+        // First cycle always sends (nothing sent yet).
+        driver.on_sync_tick(false).await;
+        assert_eq!(sync_count(), 1);
+        // Unchanged within the idle window → no resend.
+        driver.on_sync_tick(false).await;
+        assert_eq!(sync_count(), 1, "identical state should not resend");
+        // A state change resends immediately.
+        state.borrow_mut().on_foot.position.x = 5.0;
+        driver.on_sync_tick(false).await;
+        assert_eq!(sync_count(), 2, "a change should resend");
+        // A forced sync always sends, even unchanged.
+        driver.on_sync_tick(true).await;
+        assert_eq!(sync_count(), 3, "force should always send");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sync_loop_sends_while_spawned() {
         let (transport, log) = ScriptedTransport::new(happy_script(), true);
-        let mut driver = Driver::new(test_config(), transport, happy_codec());
+        let mut driver = Driver::new(test_config(), transport);
 
         loop {
             match driver.next_event().await {
@@ -1143,7 +1346,7 @@ mod tests {
         let mut sync_count = 0;
         for _ in 0..16 {
             match driver.step().await {
-                Step::SyncTick => driver.on_sync_tick().await,
+                Step::SyncTick => driver.on_sync_tick(false).await,
                 Step::Event(Some(event)) => driver.on_rak_event(event).await,
                 Step::Update => driver.registry.tick(),
                 _ => {}
@@ -1163,6 +1366,8 @@ mod tests {
             .find(|packet| packet.first() == Some(&(SyncPacketId::PlayerSync as u8)))
             .cloned()
             .expect("sync packet recorded");
-        assert_eq!(packet, vec![SyncPacketId::PlayerSync as u8, 0xAA, 0xBB]);
+        // The PlayerSync id byte followed by the real 68-byte on-foot sync body.
+        assert_eq!(packet.first(), Some(&(SyncPacketId::PlayerSync as u8)));
+        assert_eq!(packet.len(), samp_proto::ON_FOOT_SYNC_LEN + 1);
     }
 }

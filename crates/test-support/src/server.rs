@@ -32,7 +32,6 @@ enum Phase {
     AwaitConnectionRequest,
     AwaitClientJoin,
     AwaitRequestClass,
-    AwaitRequestSpawn,
     Playing,
     Closed,
 }
@@ -133,12 +132,12 @@ fn advance(
                 Reliability::ReliableOrdered,
                 0,
             );
-            Phase::AwaitRequestSpawn
-        }
-        (Phase::AwaitRequestSpawn, Inbound::Rpc { id, .. }) if *id == RpcId::RequestSpawn as u8 => {
-            let payload = wire::request_spawn_response_payload();
+            // The client no longer sends `RequestSpawn` (the spawn is server-driven now): push
+            // `RequestSpawnResponse(allow==2)` proactively so the driver's `on_spawn_response`
+            // fallback spawns it, instead of waiting for a `RequestSpawn` that never arrives.
+            let spawn = wire::request_spawn_response_payload();
             rel.enqueue(
-                &wire::rpc(RpcId::RequestSpawn, &payload),
+                &wire::rpc(RpcId::RequestSpawn, &spawn),
                 Reliability::ReliableOrdered,
                 0,
             );
