@@ -31,6 +31,13 @@ pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = 1400;
 /// Largest application payload carried in one (non-split) internal packet before we fragment.
 const SPLIT_FRAGMENT_SIZE: usize = MAX_DATAGRAM_PAYLOAD - 64;
 
+/// Largest fragment count we will reassemble — caps a hostile/buggy split header so it can't make us
+/// buffer indefinitely. 1024 × ~1.4 KB ≈ 1.4 MB, far above any real SA-MP message.
+const MAX_SPLIT_COUNT: u32 = 1024;
+
+/// Most simultaneous in-progress reassemblies kept before new split ids are dropped.
+const MAX_CONCURRENT_SPLITS: usize = 32;
+
 const INITIAL_RTO: Duration = Duration::from_millis(1000);
 const MIN_RTO: Duration = Duration::from_millis(100);
 const MAX_RTO: Duration = Duration::from_millis(3000);
@@ -445,6 +452,15 @@ impl ReliabilityLayer {
         }
 
         if let Some(s) = pkt.split {
+            // Reject implausible split headers before allocating anything for them.
+            if s.count == 0 || s.count > MAX_SPLIT_COUNT || s.index >= s.count {
+                self.splits.remove(&s.id);
+                return;
+            }
+            // Bound concurrent reassemblies so unfinished ones can't accumulate unbounded.
+            if !self.splits.contains_key(&s.id) && self.splits.len() >= MAX_CONCURRENT_SPLITS {
+                return;
+            }
             let buf = self.splits.entry(s.id).or_insert_with(|| SplitBuffer {
                 count: s.count,
                 reliability: pkt.reliability,
@@ -452,7 +468,7 @@ impl ReliabilityLayer {
                 ordering_index: pkt.ordering_index,
                 fragments: BTreeMap::new(),
             });
-            if s.count == 0 || s.count != buf.count || s.index >= s.count {
+            if s.count != buf.count {
                 self.splits.remove(&s.id);
                 return;
             }
