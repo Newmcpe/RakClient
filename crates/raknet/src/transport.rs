@@ -35,7 +35,10 @@ const TICK: Duration = Duration::from_millis(20);
 const HANDSHAKE_RETRY: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(8);
-const RECV_BUF: usize = 2048;
+/// Receive buffer sized for the largest possible UDP datagram (65507 B payload). Oversized reads on
+/// Windows fail the recv with `WSAEMSGSIZE` rather than truncating like Linux, so we never want a
+/// datagram to exceed this.
+const RECV_BUF: usize = 65535;
 
 /// Some SA-MP hosts (e.g. Arizona) run an anti-DDoS filter that drops connect/game datagrams from
 /// any source IP that has not recently sent a valid `SAMP …i` info query. Sending the query first
@@ -149,6 +152,18 @@ impl PeerTask {
                             }
                         }
                         Err(error) => {
+                            // Windows surfaces a prior send's ICMP "port unreachable" as
+                            // WSAECONNRESET (10054) and an oversized datagram as WSAEMSGSIZE (10040)
+                            // on the *next* recv — neither means the session is gone. Skip the read
+                            // and keep listening instead of tearing down (see tokio#2017).
+                            let transient = matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::WouldBlock
+                            ) || error.raw_os_error() == Some(10040);
+                            if transient {
+                                tracing::debug!(%error, "ignoring transient socket error");
+                                continue;
+                            }
                             tracing::warn!(%error, "socket recv error");
                             let _ = self
                                 .emit(RakEvent::Disconnected(DisconnectReason::ConnectionLost))
