@@ -8,3 +8,5 @@ samp-proto = { workspace = true }
 samp-client = { workspace = true }
 mlua = { version = "0.11", features = ["luau", "vendored"] }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }

@@ -422,7 +422,6 @@ impl<T: Transport> Driver<T> {
             (RPC_CONNECTION_REJECTED, _) => self.on_disconnect(DisconnectReason::Rejected),
             (RPC_CLIENT_MESSAGE, _) => self.on_client_message(payload),
             (RPC_CHAT, _) => self.on_player_chat(payload),
-            (crate::type3::RPC_TYPE3_CHALLENGE, _) => self.on_type3(payload).await,
             _ => {}
         }
     }
@@ -556,29 +555,6 @@ impl<T: Transport> Driver<T> {
             }
         }
         let _ = self.registry.dispatch_packet(Direction::Incoming, id, data);
-    }
-
-    /// Answer the Arizona type-3 anti-cheat attestation (inbound RPC 186) with the HMAC over the
-    /// requested static `core.asi` resource regions, replied as RPC 187. See [`crate::type3`].
-    async fn on_type3(&mut self, payload: &[u8]) {
-        match crate::type3::respond(payload) {
-            Some(resp) => {
-                if let Err(error) = self
-                    .transport
-                    .rpc(crate::type3::RPC_TYPE3_RESPONSE, resp)
-                    .await
-                {
-                    tracing::warn!(%error, "failed to send type-3 attestation response");
-                } else {
-                    tracing::debug!("answered type-3 attestation (RPC 186→187)");
-                }
-            }
-            None => {
-                tracing::warn!(
-                    "type-3 challenge not statically answerable (live-memory or unknown resource)"
-                )
-            }
-        }
     }
 
     fn on_client_message(&mut self, payload: &[u8]) {
@@ -728,13 +704,10 @@ impl<T: Transport> Driver<T> {
     /// Spawning before login earns "ОШИБКА 7721", so the spawn must be server-driven (or via an
     /// Send a spectator-sync packet (212) — the pre-spawn keepalive while spectating.
     async fn send_spectator_sync(&mut self) {
-        let body = SpectatorSync {
+        let packet = SpectatorSync {
             position: self.sync.position,
         }
-        .encode();
-        let mut packet = Vec::with_capacity(body.len() + 1);
-        packet.push(SyncPacketId::SpectatorSync as u8);
-        packet.extend_from_slice(&body);
+        .to_packet();
         if let Err(error) = self
             .transport
             .send(packet, Reliability::UnreliableSequenced, 0)
@@ -778,10 +751,7 @@ impl<T: Transport> Driver<T> {
                 .last_sync_at
                 .is_none_or(|at| now.duration_since(at) >= IDLE_SYNC_INTERVAL);
         if due {
-            let body = self.sync.encode();
-            let mut packet = Vec::with_capacity(body.len() + 1);
-            packet.push(SyncPacketId::PlayerSync as u8);
-            packet.extend_from_slice(&body);
+            let packet = self.sync.to_packet();
             // The sync packet passes through `onSendPacket` so scripts (e.g. aim-fix) can edit/drop it.
             let to_send = match self.registry.dispatch_packet(
                 Direction::Outgoing,

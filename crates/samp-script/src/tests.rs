@@ -383,3 +383,134 @@ fn script_queues_outgoing_chat() {
     assert_eq!(engine.drain_outgoing_chat(), vec![b"hi".to_vec()]);
     assert!(engine.drain_outgoing_chat().is_empty(), "queue drained");
 }
+
+mod type3 {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    const RES_100: &[u8] = include_bytes!("type3_res/res_100.bin");
+    const RES_101: &[u8] = include_bytes!("type3_res/res_101.bin");
+    const RES_57024: &[u8] = include_bytes!("type3_res/res_57024.bin");
+
+    fn resource(flag: u8) -> &'static [u8] {
+        match flag {
+            0x64 => RES_100,
+            0x65 => RES_101,
+            0xC0 => RES_57024,
+            other => panic!("unknown resource flag {other:#x}"),
+        }
+    }
+
+    fn hx(s: &str) -> Vec<u8> {
+        s.split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).expect("hex"))
+            .collect()
+    }
+
+    /// Oracle: reproduce the genuine client's RPC 187 body for a challenge with a given trailer, using
+    /// the real `core.asi` resources. Mirrors the responder's HMAC composition exactly.
+    fn expected_response(challenge: &[u8], trailer: &[u8]) -> Vec<u8> {
+        let key = &challenge[1..17];
+        let nonce = &challenge[17..33];
+        let n = challenge[33] as usize;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("key");
+        mac.update(nonce);
+        let mut p = 34;
+        for _ in 0..n {
+            let flag = challenge[p + 1];
+            let offset = u32::from_le_bytes(challenge[p + 2..p + 6].try_into().unwrap()) as usize;
+            let size = u16::from_le_bytes(challenge[p + 6..p + 8].try_into().unwrap()) as usize;
+            p += 8;
+            mac.update(&Sha256::digest(&resource(flag)[offset..offset + size]));
+        }
+        mac.update(trailer);
+        let mut resp = vec![3];
+        resp.extend_from_slice(nonce);
+        resp.extend_from_slice(&mac.finalize().into_bytes());
+        resp.extend_from_slice(&(trailer.len() as u16).to_le_bytes());
+        resp.extend_from_slice(trailer);
+        resp
+    }
+
+    /// The real captured Bumble Bee challenge (RPC 186 body) and its genuine response (RPC 187 body).
+    /// trailerFlags `0x44` selects a 6-byte trailer; the real client's was `01 00 00 00 5C 01`.
+    fn real_capture() -> (Vec<u8>, Vec<u8>) {
+        let challenge = hx("03 32 A6 EF 02 A1 F6 D7 FD D2 B7 58 16 53 7E 74 98 \
+             C6 0D AE 70 0A 5B 82 24 42 51 D8 73 1B 3A FA 20 \
+             03 04 64 00 00 00 00 20 00 04 C0 00 00 00 00 40 00 04 65 00 00 00 00 00 01 44");
+        let response = hx(
+            "03 C6 0D AE 70 0A 5B 82 24 42 51 D8 73 1B 3A FA 20 \
+             F8 DC 70 F0 8F 17 26 4A 3F 4D 89 19 7D 67 CB 1A 5F 34 96 94 CF 08 1A AA 8D 60 69 4C E7 22 44 69 \
+             06 00 01 00 00 00 5C 01",
+        );
+        (challenge, response)
+    }
+
+    /// Anchors the oracle to the genuine capture: fed the real trailer, it reproduces the captured
+    /// RPC 187 byte-for-byte. (The host `sha256`/`hmacSha256` are proven equivalent to this oracle by
+    /// `handler_answers_real_challenge`.)
+    #[test]
+    fn oracle_matches_real_capture() {
+        let (challenge, response) = real_capture();
+        let real_trailer = hx("01 00 00 00 5C 01");
+        assert_eq!(expected_response(&challenge, &real_trailer), response);
+    }
+
+    /// The Luau handler (driven through the host crypto bindings) answers the real RPC 186 with an
+    /// RPC 187 carrying the clean-trailer HMAC the oracle computes — proving the port reproduces the
+    /// genuine attestation math.
+    #[test]
+    fn handler_answers_real_challenge() {
+        let engine = ScriptEngine::new().expect("vm");
+        let outbox: Outbox = Rc::new(RefCell::new(VecDeque::new()));
+        engine.install_sender(outbox.clone()).expect("sender");
+        engine
+            .load_script("require('arizona')", "load arizona")
+            .expect("load");
+
+        let (challenge, _) = real_capture();
+        assert_eq!(
+            engine.dispatch_chokepoint("onReceiveRPC", 186, &challenge),
+            Verdict::Pass,
+            "reading the challenge must not rewrite or drop it"
+        );
+
+        // flags 0x44 → bits 0x04 (4 B) + 0x40 (2 B) → a 6-byte all-zero clean trailer.
+        let expected = expected_response(&challenge, &[0u8; 6]);
+        let msgs: Vec<_> = outbox.borrow_mut().drain(..).collect();
+        assert_eq!(msgs.len(), 1, "exactly one RPC 187 reply");
+        match &msgs[0] {
+            OutboundMsg::Rpc { id, payload } => {
+                assert_eq!(*id, 187, "RPC_TYPE3_RESPONSE");
+                assert_eq!(payload, &expected);
+            }
+            other => panic!("expected an RPC, got {other:?}"),
+        }
+    }
+
+    /// A live-memory field (type 0, not a static resource) can't be answered statically, so the
+    /// handler declines: nothing is queued.
+    #[test]
+    fn handler_declines_live_memory_challenge() {
+        let engine = ScriptEngine::new().expect("vm");
+        let outbox: Outbox = Rc::new(RefCell::new(VecDeque::new()));
+        engine.install_sender(outbox.clone()).expect("sender");
+        engine
+            .load_script("require('arizona')", "load arizona")
+            .expect("load");
+
+        let challenge = hx("03 \
+             00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF \
+             00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF \
+             01 00 64 00 00 00 00 20 00 44");
+        assert_eq!(
+            engine.dispatch_chokepoint("onReceiveRPC", 186, &challenge),
+            Verdict::Pass
+        );
+        assert!(outbox.borrow().is_empty(), "declined: no RPC 187 queued");
+    }
+}

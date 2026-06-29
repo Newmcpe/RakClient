@@ -10,6 +10,8 @@
 //!   Bitfield bytes (e.g. `camExtZoom:6|weaponState:2`) are kept as the raw combined `u8`.
 
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
+use crate::codec::{Encode, Packet};
+use crate::ids::SyncPacketId;
 use crate::{Quaternion, Result, Vector3};
 
 /// `hp = min((b >> 4) * 7, 100)`, `armor = min((b & 0xF) * 7, 100)` — port of
@@ -107,7 +109,7 @@ impl PlayerSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u16(self.player_id);
         w.write_bit(self.left_right_keys.is_some());
         if let Some(v) = self.left_right_keys {
@@ -134,6 +136,18 @@ impl PlayerSyncData {
             w.write_u16(v);
             w.write_u16(self.animation_flags);
         }
+    }
+}
+
+impl Packet for PlayerSyncData {
+    const ID: u8 = SyncPacketId::PlayerSync as u8;
+}
+
+impl Encode for PlayerSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -204,7 +218,7 @@ impl VehicleSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u16(self.player_id);
         w.write_u16(self.vehicle_id);
         w.write_u16(self.left_right_keys);
@@ -226,6 +240,18 @@ impl VehicleSyncData {
         if let Some(v) = self.trailer_id {
             w.write_u16(v);
         }
+    }
+}
+
+impl Packet for VehicleSyncData {
+    const ID: u8 = SyncPacketId::VehicleSync as u8;
+}
+
+impl Encode for VehicleSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -253,13 +279,25 @@ impl AimSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u8(self.cam_mode);
         w.write_vector3(self.cam_front);
         w.write_vector3(self.cam_pos);
         w.write_f32(self.aim_z);
         w.write_u8(self.cam_ext_zoom_weapon_state);
         w.write_u8(self.aspect_ratio);
+    }
+}
+
+impl Packet for AimSyncData {
+    const ID: u8 = SyncPacketId::AimSync as u8;
+}
+
+impl Encode for AimSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -286,13 +324,25 @@ impl BulletSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u8(self.target_type);
         w.write_u16(self.target_id);
         w.write_vector3(self.origin);
         w.write_vector3(self.target);
         w.write_vector3(self.center);
         w.write_u8(self.weapon_id);
+    }
+}
+
+impl Packet for BulletSyncData {
+    const ID: u8 = SyncPacketId::BulletSync as u8;
+}
+
+impl Encode for BulletSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -328,7 +378,7 @@ impl TrailerSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u16(self.trailer_id);
         w.write_vector3(self.position);
         w.write_f32(self.quaternion.x);
@@ -337,6 +387,18 @@ impl TrailerSyncData {
         w.write_f32(self.quaternion.w);
         w.write_vector3(self.move_speed);
         w.write_vector3(self.turn_speed);
+    }
+}
+
+impl Packet for TrailerSyncData {
+    const ID: u8 = SyncPacketId::TrailerSync as u8;
+}
+
+impl Encode for TrailerSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -367,7 +429,7 @@ impl UnoccupiedSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u16(self.vehicle_id);
         w.write_u8(self.seat_id);
         w.write_vector3(self.roll);
@@ -376,6 +438,18 @@ impl UnoccupiedSyncData {
         w.write_vector3(self.move_speed);
         w.write_vector3(self.turn_speed);
         w.write_f32(self.vehicle_health);
+    }
+}
+
+impl Packet for UnoccupiedSyncData {
+    const ID: u8 = SyncPacketId::UnoccupiedSync as u8;
+}
+
+impl Encode for UnoccupiedSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -409,7 +483,7 @@ impl PassengerSyncData {
         })
     }
 
-    pub fn encode(&self, w: &mut BitStreamWriter) {
+    pub fn write(&self, w: &mut BitStreamWriter) {
         w.write_u16(self.vehicle_id);
         w.write_u8(self.seat_drive_cuff);
         w.write_u8(self.weapon_special);
@@ -419,6 +493,18 @@ impl PassengerSyncData {
         w.write_u16(self.up_down_keys);
         w.write_u16(self.keys_data);
         w.write_vector3(self.position);
+    }
+}
+
+impl Packet for PassengerSyncData {
+    const ID: u8 = SyncPacketId::PassengerSync as u8;
+}
+
+impl Encode for PassengerSyncData {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        self.write(&mut w);
+        w.into_bytes()
     }
 }
 
@@ -468,7 +554,7 @@ mod tests {
             animation_flags: 0x00FF,
         };
         let mut w = BitStreamWriter::new();
-        data.encode(&mut w);
+        data.write(&mut w);
         let bytes = w.into_bytes();
         let mut r = BitStreamReader::new(&bytes);
         let got = PlayerSyncData::decode(&mut r).unwrap();
@@ -507,7 +593,7 @@ mod tests {
             ..Default::default()
         };
         let mut w = BitStreamWriter::new();
-        data.encode(&mut w);
+        data.write(&mut w);
         let bytes = w.into_bytes();
         let mut r = BitStreamReader::new(&bytes);
         let got = PlayerSyncData::decode(&mut r).unwrap();
@@ -544,7 +630,7 @@ mod tests {
             trailer_id: Some(412),
         };
         let mut w = BitStreamWriter::new();
-        data.encode(&mut w);
+        data.write(&mut w);
         let bytes = w.into_bytes();
         let mut r = BitStreamReader::new(&bytes);
         let got = VehicleSyncData::decode(&mut r).unwrap();
@@ -576,7 +662,7 @@ mod tests {
             aspect_ratio: 200,
         };
         let mut w = BitStreamWriter::new();
-        aim.encode(&mut w);
+        aim.write(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 31);
         let mut r = BitStreamReader::new(&bytes);
@@ -591,7 +677,7 @@ mod tests {
             weapon_id: 31,
         };
         let mut w = BitStreamWriter::new();
-        bullet.encode(&mut w);
+        bullet.write(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 40);
         let mut r = BitStreamReader::new(&bytes);
@@ -610,7 +696,7 @@ mod tests {
             turn_speed: vec3(0.8, 0.9, 1.0),
         };
         let mut w = BitStreamWriter::new();
-        trailer.encode(&mut w);
+        trailer.write(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 54);
         let mut r = BitStreamReader::new(&bytes);
@@ -627,7 +713,7 @@ mod tests {
             vehicle_health: 1000.0,
         };
         let mut w = BitStreamWriter::new();
-        unocc.encode(&mut w);
+        unocc.write(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 67);
         let mut r = BitStreamReader::new(&bytes);
@@ -645,7 +731,7 @@ mod tests {
             position: vec3(5.0, 6.0, 7.0),
         };
         let mut w = BitStreamWriter::new();
-        passenger.encode(&mut w);
+        passenger.write(&mut w);
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 24);
         let mut r = BitStreamReader::new(&bytes);

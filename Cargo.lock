@@ -747,10 +747,8 @@ dependencies = [
 name = "samp-client"
 version = "0.1.0"
 dependencies = [
- "hmac",
  "raknet",
  "samp-proto",
- "sha2",
  "test-support",
  "thiserror",
  "tokio",
@@ -773,9 +771,11 @@ dependencies = [
 name = "samp-script"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "mlua",
  "samp-client",
  "samp-proto",
+ "sha2",
  "tracing",
 ]
 

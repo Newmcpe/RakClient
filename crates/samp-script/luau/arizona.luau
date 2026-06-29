@@ -9,6 +9,7 @@
 -- reliability 9) via `packet:sendEx`, matching the real client.
 
 require("addon") -- newTask/wait scheduler used by validate()
+require("arizona.type3") -- registers the RPC 186→187 anti-cheat attestation responder
 local packet = require("packet")
 
 local AZ = 220 -- Arizona CEF / custom-packet id

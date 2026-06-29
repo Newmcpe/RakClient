@@ -13,6 +13,7 @@ use mlua::{Function, IntoLua, IntoLuaMulti, Lua, Table, Value, Variadic};
 
 mod bindings;
 mod bitstream;
+mod crypto;
 mod require;
 use samp_proto::{Encode, OutboundMsg, Outbox, Verdict};
 
@@ -37,6 +38,7 @@ impl ScriptEngine {
         install_text_codec(&lua)?;
         let outgoing_chat: OutgoingChat = Rc::new(RefCell::new(Vec::new()));
         install_send_chat(&lua, outgoing_chat.clone())?;
+        crypto::install_crypto(&lua)?;
         lua.globals().set("sampev", lua.create_table()?)?;
         lua.globals().set("__rakHandlers", lua.create_table()?)?;
         install_register_handler(&lua)?;
