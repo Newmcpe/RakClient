@@ -17,6 +17,16 @@ pub trait Packet {
 /// Client→server body: serializes itself (the id byte is NOT included).
 pub trait Encode: Packet {
     fn encode(&self) -> Vec<u8>;
+
+    /// The full wire packet with the id byte prepended (the sync/`transport.send` path; RPCs send
+    /// the id separately via `transport.rpc`).
+    fn to_packet(&self) -> Vec<u8> {
+        let body = self.encode();
+        let mut packet = Vec::with_capacity(body.len() + 1);
+        packet.push(Self::ID);
+        packet.extend_from_slice(&body);
+        packet
+    }
 }
 
 /// Server→client body: parses from the payload (the id byte is already stripped).

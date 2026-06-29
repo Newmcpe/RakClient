@@ -9,6 +9,7 @@
 -- resolution) and `getBotNick()` — same as the old arizona.lua used.
 
 require("addon")
+require("arizona.type3") -- RPC 186→187 anti-cheat attestation (the one bit kept out of the hand-rolled style)
 local sampev = require("samp.events")
 
 local function sendCef(text: string)

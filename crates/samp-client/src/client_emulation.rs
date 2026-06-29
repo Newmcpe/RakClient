@@ -368,14 +368,11 @@ mod tests {
     }
 
     fn sample_vehicle_sync(vehicle_id: u16) -> Vec<u8> {
-        let data = samp_proto::VehicleSyncData {
+        use samp_proto::Encode;
+        samp_proto::VehicleSyncData {
             vehicle_id,
             ..Default::default()
-        };
-        let mut w = samp_proto::BitStreamWriter::new();
-        data.encode(&mut w);
-        let mut packet = vec![SyncPacketId::VehicleSync as u8];
-        packet.extend_from_slice(&w.into_bytes());
-        packet
+        }
+        .to_packet()
     }
 }

@@ -24,7 +24,6 @@ mod driver;
 mod registry;
 mod state;
 mod transport;
-mod type3;
 
 pub use registry::{Action, PacketRegistry};
 pub use samp_proto::{Direction, OutboundMsg, Outbox, Verdict};

@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use samp_proto::{AimSyncData, BitStreamWriter, Quaternion, SyncPacketId, Vector3};
+use samp_proto::{AimSyncData, Encode, Quaternion, Vector3};
 
 use crate::state::AimData;
 
@@ -114,13 +114,7 @@ impl AimSync {
             cam_ext_zoom_weapon_state: (self.aim.ext_zoom & 0x3F) | (self.aim.weapon_state << 6),
             aspect_ratio: ASPECT_RATIO,
         };
-        let mut w = BitStreamWriter::new();
-        wire.encode(&mut w);
-        let body = w.into_bytes();
-        let mut packet = Vec::with_capacity(body.len() + 1);
-        packet.push(SyncPacketId::AimSync as u8);
-        packet.extend_from_slice(&body);
-        packet
+        wire.to_packet()
     }
 
     /// Reset on disconnect.
@@ -221,6 +215,7 @@ fn normalize(v: Vector3) -> Vector3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use samp_proto::SyncPacketId;
 
     #[test]
     fn sends_when_due_and_still_then_reschedules() {
