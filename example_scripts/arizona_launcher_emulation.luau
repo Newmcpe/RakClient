@@ -23,9 +23,9 @@ function sampev.onSendClientJoin(
 )
     arizona.host = SERVER_HOST
     -- Pre-join CEF, in the real client's order.
-    arizona.sendCef(APP_VERSION)
-    arizona.sendCef("inventoryItemsLoaded")
+    arizona.cef.send(APP_VERSION)
+    arizona.cef.send("inventoryItemsLoaded")
     -- Post-join validation set (220/140, 20, 50, 38, onSvelteAppInit) fires shortly after.
-    newTask(arizona.validation, 100)
+    newTask(arizona.validate, 100)
     return { JOIN_VERSION, 1, nickname, challengeResponse, joinAuthKey, CLIENT_VERSION, challengeResponse2 }
 end
