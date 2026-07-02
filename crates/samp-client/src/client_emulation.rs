@@ -11,16 +11,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use samp_proto::events::{self, FieldValue as F};
+use samp_proto::events::incoming::{
+    ClientCheck, GivePlayerWeapon, ResetPlayerWeapons, SetPlayerArmedWeapon, SetWeaponAmmo,
+};
+use samp_proto::events::outgoing::SendClientCheckResponse;
+use samp_proto::events::{decode_event, encode_event};
 use samp_proto::{encode_weapons_update, OutboundMsg, SyncPacketId, RELIABILITY_RELIABLE_ORDERED};
 
 use crate::state::{AimData, LocalPlayer};
-
-const RPC_RESET_WEAPONS: u8 = 21;
-const RPC_GIVE_WEAPON: u8 = 22;
-const RPC_SET_ARMED_WEAPON: u8 = 67;
-const RPC_CLIENT_CHECK: u8 = 103;
-const RPC_SET_WEAPON_AMMO: u8 = 145;
 
 /// The on-ground player-state address the server expects echoed in the `ClientCheck` `0x2` answer.
 const ADR_ON_GROUND: i32 = 268_435_970;
@@ -103,39 +101,36 @@ impl ClientEmulation {
         payload: &[u8],
     ) -> Vec<OutboundMsg> {
         match id {
-            RPC_CLIENT_CHECK => self.answer_client_check(lp, payload).into_iter().collect(),
-            RPC_GIVE_WEAPON => {
-                let Some((weapon, ammo)) = decode_two_i32(id, payload) else {
+            ClientCheck::RPC_ID => self.answer_client_check(lp, payload).into_iter().collect(),
+            GivePlayerWeapon::RPC_ID => {
+                let Ok(ev) = decode_event::<GivePlayerWeapon>(payload) else {
                     return Vec::new();
                 };
                 if lp
                     .weapons
-                    .give(weapon as u8, ammo.clamp(0, u16::MAX as i32) as u16)
+                    .give(ev.weapon_id as u8, ev.ammo.clamp(0, u16::MAX as i32) as u16)
                 {
                     vec![weapons_update_msg(lp)]
                 } else {
                     Vec::new()
                 }
             }
-            RPC_SET_ARMED_WEAPON => {
-                if let Some(F::I32(weapon)) = first_field(id, payload) {
-                    lp.weapons.set_armed(weapon as u8);
+            SetPlayerArmedWeapon::RPC_ID => {
+                if let Ok(ev) = decode_event::<SetPlayerArmedWeapon>(payload) {
+                    lp.weapons.set_armed(ev.weapon_id as u8);
                 }
                 Vec::new()
             }
-            RPC_SET_WEAPON_AMMO => {
-                let values = match events::decode_incoming(id, payload) {
-                    Some(Ok((_, values))) => values,
-                    _ => return Vec::new(),
+            SetWeaponAmmo::RPC_ID => {
+                let Ok(ev) = decode_event::<SetWeaponAmmo>(payload) else {
+                    return Vec::new();
                 };
-                if let (Some(F::U8(weapon)), Some(F::U16(ammo))) = (values.first(), values.get(1)) {
-                    if lp.weapons.set_ammo(*weapon, *ammo) {
-                        return vec![weapons_update_msg(lp)];
-                    }
+                if lp.weapons.set_ammo(ev.weapon_id, ev.ammo) {
+                    return vec![weapons_update_msg(lp)];
                 }
                 Vec::new()
             }
-            RPC_RESET_WEAPONS => {
+            ResetPlayerWeapons::RPC_ID => {
                 lp.weapons.reset();
                 vec![weapons_update_msg(lp)]
             }
@@ -162,41 +157,38 @@ impl ClientEmulation {
     }
 
     fn answer_client_check(&mut self, lp: &LocalPlayer, payload: &[u8]) -> Option<OutboundMsg> {
-        let values = match events::decode_incoming(RPC_CLIENT_CHECK, payload) {
-            Some(Ok((_, values))) => values,
-            _ => return None,
-        };
-        let (F::U8(request_type), Some(F::I32(subject))) = (values.first()?, values.get(1)) else {
-            return None;
-        };
+        let ClientCheck {
+            request_type,
+            subject,
+            ..
+        } = decode_event::<ClientCheck>(payload).ok()?;
         // 0x2 player state, 0x48 client uptime, 0x46/0x47 model/collision checksums.
-        let (result1, result2): (i32, u8) = match *request_type {
+        let (result1, result2): (i32, u8) = match request_type {
             0x2 => (ADR_ON_GROUND, if lp.in_vehicle() { 2 } else { 1 }),
             0x48 => {
                 let uptime = self.uptime_base + self.started.elapsed().as_secs_f32();
                 (uptime as i64 as i32, 0)
             }
             0x46 => (
-                *subject,
-                memo_hash(&mut self.model_hashes, &mut self.rng, *subject as u32),
+                subject,
+                memo_hash(&mut self.model_hashes, &mut self.rng, subject as u32),
             ),
             0x47 => (
-                *subject,
-                memo_hash(&mut self.col_hashes, &mut self.rng, *subject as u32),
+                subject,
+                memo_hash(&mut self.col_hashes, &mut self.rng, subject as u32),
             ),
             other => {
                 tracing::debug!(request_type = other, "unhandled ClientCheck type");
                 return None;
             }
         };
-        let body = events::encode_outgoing(
-            RPC_CLIENT_CHECK,
-            &[F::U8(*request_type), F::I32(result1), F::U8(result2)],
-        )?
-        .ok()?;
         Some(OutboundMsg::Rpc {
-            id: RPC_CLIENT_CHECK,
-            payload: body,
+            id: SendClientCheckResponse::RPC_ID,
+            payload: encode_event(&SendClientCheckResponse {
+                request_type,
+                result1,
+                result2,
+            }),
         })
     }
 }
@@ -210,23 +202,6 @@ fn weapons_update_msg(lp: &LocalPlayer) -> OutboundMsg {
         data,
         reliability: RELIABILITY_RELIABLE_ORDERED,
         channel: 0,
-    }
-}
-
-fn first_field(id: u8, payload: &[u8]) -> Option<F> {
-    match events::decode_incoming(id, payload) {
-        Some(Ok((_, values))) => values.into_iter().next(),
-        _ => None,
-    }
-}
-
-fn decode_two_i32(id: u8, payload: &[u8]) -> Option<(i32, i32)> {
-    match events::decode_incoming(id, payload) {
-        Some(Ok((_, values))) => match (values.first(), values.get(1)) {
-            (Some(F::I32(a)), Some(F::I32(b))) => Some((*a, *b)),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -286,24 +261,24 @@ mod tests {
     }
 
     fn client_check_body(request_type: u8, subject: i32) -> Vec<u8> {
-        events::encode_incoming(
-            RPC_CLIENT_CHECK,
-            &[F::U8(request_type), F::I32(subject), F::U16(0), F::U16(0)],
-        )
-        .unwrap()
-        .unwrap()
+        encode_event(&ClientCheck {
+            request_type,
+            subject,
+            offset: 0,
+            length: 0,
+        })
     }
 
     #[test]
     fn client_check_player_state_reports_on_ground_and_on_foot() {
         let mut e = ClientEmulation::new(1, Instant::now());
         let mut player = lp();
-        let out = e.on_incoming_rpc(&mut player, RPC_CLIENT_CHECK, &client_check_body(0x2, 0));
+        let out = e.on_incoming_rpc(&mut player, ClientCheck::RPC_ID, &client_check_body(0x2, 0));
         assert_eq!(out.len(), 1);
         let OutboundMsg::Rpc { id, payload } = &out[0] else {
             panic!("expected rpc")
         };
-        assert_eq!(*id, RPC_CLIENT_CHECK);
+        assert_eq!(*id, ClientCheck::RPC_ID);
         assert_eq!(payload[0], 0x2);
         assert_eq!(
             i32::from_le_bytes(payload[1..5].try_into().unwrap()),
@@ -316,8 +291,16 @@ mod tests {
     fn client_check_model_hash_is_memoized() {
         let mut e = ClientEmulation::new(7, Instant::now());
         let mut player = lp();
-        let first = e.on_incoming_rpc(&mut player, RPC_CLIENT_CHECK, &client_check_body(0x46, 999));
-        let again = e.on_incoming_rpc(&mut player, RPC_CLIENT_CHECK, &client_check_body(0x46, 999));
+        let first = e.on_incoming_rpc(
+            &mut player,
+            ClientCheck::RPC_ID,
+            &client_check_body(0x46, 999),
+        );
+        let again = e.on_incoming_rpc(
+            &mut player,
+            ClientCheck::RPC_ID,
+            &client_check_body(0x46, 999),
+        );
         let hash = |o: &[OutboundMsg]| match &o[0] {
             OutboundMsg::Rpc { payload, .. } => payload[5],
             _ => panic!(),
@@ -329,16 +312,45 @@ mod tests {
     fn give_weapon_emits_weapons_update_and_tracks_inventory() {
         let mut e = ClientEmulation::new(2, Instant::now());
         let mut player = lp();
-        let body = events::encode_incoming(RPC_GIVE_WEAPON, &[F::I32(24), F::I32(50)])
-            .unwrap()
-            .unwrap();
-        let out = e.on_incoming_rpc(&mut player, RPC_GIVE_WEAPON, &body);
+        let body = encode_event(&GivePlayerWeapon {
+            weapon_id: 24,
+            ammo: 50,
+        });
+        let out = e.on_incoming_rpc(&mut player, GivePlayerWeapon::RPC_ID, &body);
         assert_eq!(out.len(), 1);
         assert!(
             matches!(&out[0], OutboundMsg::Packet { data, .. } if data[0] == SyncPacketId::WeaponsUpdate as u8)
         );
         assert_eq!(player.weapons.current, 24);
         assert_eq!(player.weapons.slots[2].ammo, 50);
+    }
+
+    #[test]
+    fn set_armed_weapon_updates_current_weapon() {
+        let mut e = ClientEmulation::new(5, Instant::now());
+        let mut player = lp();
+        player.weapons.give(24, 50);
+        let body = encode_event(&SetPlayerArmedWeapon { weapon_id: 31 });
+        let out = e.on_incoming_rpc(&mut player, SetPlayerArmedWeapon::RPC_ID, &body);
+        assert!(out.is_empty());
+        assert_eq!(player.weapons.current, 31);
+    }
+
+    #[test]
+    fn set_weapon_ammo_updates_slot_and_emits_weapons_update_when_changed() {
+        let mut e = ClientEmulation::new(6, Instant::now());
+        let mut player = lp();
+        player.weapons.give(24, 50);
+        let body = encode_event(&SetWeaponAmmo {
+            weapon_id: 24,
+            ammo: 80,
+        });
+        let out = e.on_incoming_rpc(&mut player, SetWeaponAmmo::RPC_ID, &body);
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0], OutboundMsg::Packet { data, .. } if data[0] == SyncPacketId::WeaponsUpdate as u8)
+        );
+        assert_eq!(player.weapons.slots[2].ammo, 80);
     }
 
     #[test]
