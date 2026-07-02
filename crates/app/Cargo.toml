@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "RakClient binary: connect a SA-MP client to a server and run it to Spawned."
 

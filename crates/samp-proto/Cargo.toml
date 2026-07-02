@@ -1,6 +1,6 @@
 [package]
 name = "samp-proto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "SA-MP 0.3.7 wire protocol: BitStream, packet/RPC ids, and typed (de)serializers."
 
