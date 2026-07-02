@@ -315,9 +315,7 @@ impl<T: Transport> Driver<T> {
         // (the server drives the spawn via RequestSpawnResponse(allow==2) after login); this is the
         // manual override. Sets `spawn_requested` so a non-2 allow still spawns us.
         if spawn_requested && self.spectating {
-            self.spawn_requested = true;
-            let payload = RequestSpawn.encode();
-            self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
+            self.request_spawn().await;
         }
         if force_sync && matches!(self.state, ConnectionState::Spawned) {
             self.on_sync_tick(true).await;
@@ -591,12 +589,8 @@ impl<T: Transport> Driver<T> {
     }
 
     async fn on_init_game(&mut self, payload: &[u8]) {
-        let init = match InitGame::decode(payload) {
-            Ok(init) => init,
-            Err(error) => {
-                tracing::warn!(%error, "failed to decode init game");
-                return;
-            }
+        let Some(init) = decode_or_warn::<InitGame>(payload, "init game") else {
+            return;
         };
         self.local_id = init.local_player_id;
         let host_name = init.host_name;
@@ -630,6 +624,13 @@ impl<T: Transport> Driver<T> {
         self.send_rpc(RpcId::RequestClass as u8, payload).await;
     }
 
+    /// Send `RequestSpawn` (RPC) and mark that we asked, so a non-`allow==2` response still spawns us.
+    async fn request_spawn(&mut self) {
+        self.spawn_requested = true;
+        let payload = RequestSpawn.encode();
+        self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
+    }
+
     /// Pre-spawn tick while spectating: only the optional self-spawn fallback runs here. A real
     /// client sends neither a periodic `RequestClass` re-request nor an automatic `UpdateScoresPingsIPs`
     /// heartbeat while waiting to spawn (live capture: `RequestClass` never appears in a real client's
@@ -658,12 +659,9 @@ impl<T: Transport> Driver<T> {
     }
 
     async fn on_class_response(&mut self, payload: &[u8]) {
-        let response = match RequestClassResponse::decode(payload) {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(%error, "failed to decode class response");
-                return;
-            }
+        let Some(response) = decode_or_warn::<RequestClassResponse>(payload, "class response")
+        else {
+            return;
         };
         if response.allowed {
             self.sync.position = response.spawn_position;
@@ -676,19 +674,14 @@ impl<T: Transport> Driver<T> {
         // `RequestSpawnResponse`, which spawns us. Before spawn info we keep spectating (requesting
         // spawn early earns "ОШИБКА 7721").
         if self.spawn_info_position.is_some() && self.spectating {
-            self.spawn_requested = true;
-            let payload = RequestSpawn.encode();
-            self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
+            self.request_spawn().await;
         }
     }
 
     async fn on_spawn_response(&mut self, payload: &[u8]) {
-        let response = match RequestSpawnResponse::decode(payload) {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(%error, "failed to decode spawn response");
-                return;
-            }
+        let Some(response) = decode_or_warn::<RequestSpawnResponse>(payload, "spawn response")
+        else {
+            return;
         };
         // RakSAMP Lite's RPC_RequestSpawnResponse condition (0x45ace0): spawn when `allow == 2`, or
         // when `allow != 0` while we explicitly requested spawn. On Arizona the server sends
@@ -706,26 +699,23 @@ impl<T: Transport> Driver<T> {
     /// `SetSpawnInfo` (RPC 68): remember the spawn position for `enter_spawned`, like RakSAMP Lite's
     /// `has_spawn_info` + `Net_Spawn` position copy.
     fn on_set_spawn_info(&mut self, payload: &[u8]) {
-        match decode_event::<SetSpawnInfo>(payload) {
-            Ok(info) => {
-                let pos = info.position;
-                tracing::debug!(x = pos.x, y = pos.y, z = pos.z, "spawn info position");
-                self.spawn_info_position = Some(pos);
-            }
-            Err(error) => tracing::warn!(%error, "failed to decode spawn info"),
-        }
+        let Some(info) = decode_event_or_warn::<SetSpawnInfo>(payload, "spawn info") else {
+            return;
+        };
+        let pos = info.position;
+        tracing::debug!(x = pos.x, y = pos.y, z = pos.z, "spawn info position");
+        self.spawn_info_position = Some(pos);
     }
 
     /// `TogglePlayerSpectating` (RPC 124): the Arizona server toggles spectate ON during login and
     /// OFF afterwards. A `1 → 0` transition means "drop out of spectate" → spawn, exactly like
     /// RakSAMP Lite's `sub_45B260 → Net_Spawn`. This is the server-driven spawn, no explicit call.
     async fn on_toggle_spectating(&mut self, payload: &[u8]) {
-        let toggle = match decode_event::<TogglePlayerSpectating>(payload) {
-            Ok(ev) => ev.state,
-            Err(error) => {
-                tracing::warn!(%error, "failed to decode spectating toggle");
-                return;
-            }
+        let Some(toggle) =
+            decode_event_or_warn::<TogglePlayerSpectating>(payload, "spectating toggle")
+                .map(|ev| ev.state)
+        else {
+            return;
         };
         let was_spectating = self.server_spectating;
         self.server_spectating = toggle;
@@ -1016,6 +1006,31 @@ async fn poll_interval(timer: &mut Option<Interval>) {
             interval.tick().await;
         }
         None => future::pending::<()>().await,
+    }
+}
+
+/// Decode a `Decode` packet body, warning and returning `None` on failure.
+fn decode_or_warn<T: Decode>(payload: &[u8], what: &'static str) -> Option<T> {
+    match T::decode(payload) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(%error, "failed to decode {what}");
+            None
+        }
+    }
+}
+
+/// Decode a `WireDecode` event body, warning and returning `None` on failure.
+fn decode_event_or_warn<T: samp_proto::events::WireDecode>(
+    payload: &[u8],
+    what: &'static str,
+) -> Option<T> {
+    match decode_event::<T>(payload) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(%error, "failed to decode {what}");
+            None
+        }
     }
 }
 
