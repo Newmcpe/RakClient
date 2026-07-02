@@ -386,6 +386,7 @@ fn script_queues_outgoing_chat() {
 
 mod type3 {
     use super::*;
+    use hmac::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
     use std::cell::RefCell;

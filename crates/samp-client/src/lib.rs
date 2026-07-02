@@ -25,6 +25,7 @@ mod registry;
 mod state;
 mod transport;
 
+pub use raknet::ProxyConfig;
 pub use registry::{Action, PacketRegistry};
 pub use samp_proto::{Direction, OutboundMsg, Outbox, Verdict};
 pub use state::{
@@ -57,6 +58,13 @@ pub struct ClientConfig {
     pub gpci: Option<String>,
     pub sync_interval: Duration,
     pub reconnect_delay: Duration,
+    /// If set, and the server never drives the spawn (`SetSpawnInfo`/`TogglePlayerSpectating`),
+    /// self-spawn after this long in the pre-spawn window. `None` ⇒ never self-spawn: stay
+    /// spectating (the correct mode for Arizona, whose anti-cheat kicks an unauthorised RPC_Spawn as
+    /// "подозрение в читерстве"; a spectating client still receives chat/world state).
+    pub self_spawn_timeout: Option<Duration>,
+    /// Optional SOCKS5 proxy to tunnel the UDP game traffic through (fresh source IP).
+    pub proxy: Option<raknet::ProxyConfig>,
 }
 
 impl ClientConfig {
@@ -71,6 +79,8 @@ impl ClientConfig {
                 gpci: None,
                 sync_interval: Duration::from_millis(100),
                 reconnect_delay: Duration::from_secs(5),
+                self_spawn_timeout: None,
+                proxy: None,
             },
         }
     }
@@ -100,6 +110,10 @@ impl ClientConfigBuilder {
     }
     pub fn sync_interval(mut self, interval: Duration) -> Self {
         self.config.sync_interval = interval;
+        self
+    }
+    pub fn self_spawn_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.config.self_spawn_timeout = timeout;
         self
     }
     pub fn reconnect_delay(mut self, delay: Duration) -> Self {
@@ -162,6 +176,7 @@ impl Client {
         let rak_config = raknet::RakConfig {
             password: config.password.clone(),
             static_data: Vec::new(),
+            proxy: config.proxy.clone(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
         let driver = driver::Driver::new(config, transport);
@@ -180,6 +195,7 @@ impl Client {
         let rak_config = raknet::RakConfig {
             password: config.password.clone(),
             static_data: Vec::new(),
+            proxy: config.proxy.clone(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
         let driver = driver::Driver::new(config, transport)

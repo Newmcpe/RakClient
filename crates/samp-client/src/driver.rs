@@ -45,8 +45,22 @@ const RPC_CHAT: u8 = RpcId::Chat as u8;
 /// `toggle=0` to drop us out — at which point RakSAMP Lite (`sub_45B260`) calls `Net_Spawn`. This is
 /// the Arizona post-login spawn trigger.
 const RPC_TOGGLE_SPECTATING: u8 = 124;
+/// `RPC_ScrSetSpawnInfo` (68). RakSAMP Lite (`0x45AC00`) stores the position it carries, and
+/// `Net_Spawn` (`0x455C70`) copies it into the local sync position at spawn time — this is where the
+/// post-spawn position comes from.
+const RPC_SET_SPAWN_INFO: u8 = 68;
 
 const SPAWN_HEALTH: u8 = 100;
+
+/// Fallback spawn position for [`Driver::enter_spawned`] when the server never sent `SetSpawnInfo`
+/// (the self-spawn fallback path). Decoded from a real captured `SetSpawnInfo` body on Arizona's
+/// Bumble Bee server (`[u8 team=255][u32 skin][u8 unused][f32 x,y,z,zAngle]...`, floats at byte
+/// offsets 6/10/14/18) rather than defaulting to the map origin.
+const FALLBACK_SPAWN_POSITION: Vector3 = Vector3 {
+    x: 1765.50,
+    y: -1892.70,
+    z: 13.56,
+};
 
 /// What woke the `select!` in [`Driver::step`].
 enum Step {
@@ -90,10 +104,12 @@ pub(crate) struct Driver<T: Transport> {
     /// Mirrors RakSAMP Lite's `g_bSpectating`: the last `TogglePlayerSpectating` value from the server.
     /// A `1 → 0` transition is the server dropping us out of spectate → spawn (the Arizona trigger).
     server_spectating: bool,
-    /// Set when a login `DialogResponse` is sent while spectating; the pump loop then spawns. This is
-    /// the order the real client uses (login dialog answered → spawn), deferred to avoid recursing
-    /// through `send_rpc`.
-    spawn_after_login: bool,
+    /// Position from `SetSpawnInfo` (RPC 68); `enter_spawned` loads it into the sync position,
+    /// mirroring RakSAMP Lite's `Net_Spawn` — without this the bot reports 0,0,0 after spawn.
+    spawn_info_position: Option<Vector3>,
+    /// When the pre-spawn window began — the class response or the server's spectate-on toggle,
+    /// whichever lands first; drives the optional self-spawn fallback (`config.self_spawn_timeout`).
+    class_selected_at: Option<Instant>,
 }
 
 impl<T: Transport> Driver<T> {
@@ -126,7 +142,8 @@ impl<T: Transport> Driver<T> {
             spectating: false,
             spawn_requested: false,
             server_spectating: false,
-            spawn_after_login: false,
+            spawn_info_position: None,
+            class_selected_at: None,
         }
     }
 
@@ -182,11 +199,6 @@ impl<T: Transport> Driver<T> {
             }
             self.flush_outbox().await;
             self.poll_bot_actions().await;
-            if self.spawn_after_login && !matches!(self.state, ConnectionState::Spawned) {
-                self.spawn_after_login = false;
-                self.spectating = false;
-                self.enter_spawned().await;
-            }
         }
     }
 
@@ -230,14 +242,6 @@ impl<T: Transport> Driver<T> {
                         payload = %payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                         "outbound RPC",
                     );
-                    // A script answering the login dialog (`sampSendDialogResponse`) while we spectate
-                    // → spawn next, the order the real client uses (login answered → spawn).
-                    if self.spectating
-                        && id == RpcId::DialogResponse as u8
-                        && !matches!(self.state, ConnectionState::Spawned)
-                    {
-                        self.spawn_after_login = true;
-                    }
                     self.transport.rpc(id, payload).await
                 }
             };
@@ -271,6 +275,9 @@ impl<T: Transport> Driver<T> {
             self.sync.health = s.on_foot.health;
             self.sync.armour = s.on_foot.armour;
             self.sync.weapon = WeaponId(s.on_foot.weapon);
+            self.sync.move_speed = s.on_foot.move_speed;
+            self.sync.animation_id = s.on_foot.animation_id;
+            self.sync.animation_flags = s.on_foot.animation_flags;
         }
     }
 
@@ -409,9 +416,12 @@ impl<T: Transport> Driver<T> {
         self.emulation_incoming(id, payload).await;
         match (id, &self.state) {
             (RPC_INIT_GAME, ConnectionState::Joining) => self.on_init_game(payload).await,
-            (RPC_REQUEST_CLASS, ConnectionState::ClassSelection) => {
-                self.on_class_response(payload).await
-            }
+            // We re-request class every second pre-spawn, so class responses arrive in both
+            // ClassSelection and ClassSelected; once we have spawn info the response requests spawn.
+            (
+                RPC_REQUEST_CLASS,
+                ConnectionState::ClassSelection | ConnectionState::ClassSelected,
+            ) => self.on_class_response(payload).await,
             // The server drives the spawn with `RequestSpawnResponse` while we're spectating
             // (ClassSelection/ClassSelected), or it answers an explicit `sampSpawnPlayer()` RequestSpawn.
             (
@@ -419,6 +429,7 @@ impl<T: Transport> Driver<T> {
                 ConnectionState::ClassSelection | ConnectionState::ClassSelected,
             ) => self.on_spawn_response(payload).await,
             (RPC_TOGGLE_SPECTATING, _) => self.on_toggle_spectating(payload).await,
+            (RPC_SET_SPAWN_INFO, _) => self.on_set_spawn_info(payload),
             (RPC_CONNECTION_REJECTED, _) => self.on_disconnect(DisconnectReason::Rejected),
             (RPC_CLIENT_MESSAGE, _) => self.on_client_message(payload),
             (RPC_CHAT, _) => self.on_player_chat(payload),
@@ -603,17 +614,45 @@ impl<T: Transport> Driver<T> {
         self.request_spawn_class().await;
     }
 
-    /// After join, request a class and spectate. Like RakSAMP Lite (`RPC_InitGame → RequestClass`) we
-    /// do NOT request spawn here — the server drives the spawn via `RequestSpawnResponse(allow==2)`
-    /// (or the script calls `sampSpawnPlayer()`). Until then we send spectator sync.
+    /// After join, spectate and start the pre-spawn poll. Like RakSAMP Lite (`client_app.cpp`) we send
+    /// `RequestClass` now and re-send it every second (plus the score/ping) until the server sends
+    /// `SetSpawnInfo`; the spawn is then driven by the class response (with spawn info),
+    /// `RequestSpawnResponse(allow==2)`, or `TogglePlayerSpectating(1→0)`.
     async fn request_spawn_class(&mut self) {
+        self.spectating = true;
+        self.transition(ConnectionState::ClassSelection);
         let payload = RequestClass {
             class: self.config.default_class,
         }
         .encode();
         self.send_rpc(RpcId::RequestClass as u8, payload).await;
-        self.spectating = true;
-        self.transition(ConnectionState::ClassSelection);
+    }
+
+    /// Pre-spawn tick while spectating: only the optional self-spawn fallback runs here. A real
+    /// client sends neither a periodic `RequestClass` re-request nor an automatic `UpdateScoresPingsIPs`
+    /// heartbeat while waiting to spawn (live capture: `RequestClass` never appears in a real client's
+    /// outbound traffic at all, and `UpdateScoresPingsIPs` only fires once, user-triggered by opening
+    /// the scoreboard, hours into a session — never automatically near join). Sending either on a
+    /// steady 1s cadence during the exact window the server decides whether to grant a spawn is a
+    /// distinctive non-human traffic pattern a server could key an anti-bot check on, so we don't.
+    async fn send_prespawn_poll(&mut self) {
+        // The self-spawn fallback (`config.self_spawn_timeout`) is opt-in and OFF by default. On
+        // Arizona an unauthorised RPC_Spawn (no server `SetSpawnInfo`) trips the anti-cheat, which
+        // kicks with "подозрение в читерстве" ~60s later — verified live. A spectating client is not
+        // flagged and still receives chat/world state, so staying spectating is the safe default; the
+        // fallback exists only for non-Arizona servers that legitimately never drive the spawn.
+        let Some(timeout) = self.config.self_spawn_timeout else {
+            return;
+        };
+        if let Some(t) = self.class_selected_at {
+            if Instant::now().duration_since(t) >= timeout {
+                tracing::warn!(
+                    "server never drove the spawn — spawning without server authorisation"
+                );
+                self.spectating = false;
+                self.enter_spawned().await;
+            }
+        }
     }
 
     async fn on_class_response(&mut self, payload: &[u8]) {
@@ -628,10 +667,17 @@ impl<T: Transport> Driver<T> {
             self.sync.position = response.spawn_position;
             self.mirror_to_state();
         }
-        // Like RakSAMP Lite, do NOT auto-request spawn — keep spectating and let the server drive the
-        // spawn via `RequestSpawnResponse(allow==2)` (it sends that after login on Arizona). Requesting
-        // spawn here would prompt an early allow and spawn us before login → "ОШИБКА 7721".
         self.transition(ConnectionState::ClassSelected);
+        self.class_selected_at.get_or_insert_with(Instant::now);
+        // RakSAMP Lite (`network_transport.cpp`): on a class response, if the server has already sent
+        // `SetSpawnInfo` (i.e. login is done), request spawn now — the server answers with
+        // `RequestSpawnResponse`, which spawns us. Before spawn info we keep spectating (requesting
+        // spawn early earns "ОШИБКА 7721").
+        if self.spawn_info_position.is_some() && self.spectating {
+            self.spawn_requested = true;
+            let payload = RequestSpawn.encode();
+            self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
+        }
     }
 
     async fn on_spawn_response(&mut self, payload: &[u8]) {
@@ -655,6 +701,20 @@ impl<T: Transport> Driver<T> {
         self.enter_spawned().await;
     }
 
+    /// `SetSpawnInfo` (RPC 68): remember the spawn position for `enter_spawned`, like RakSAMP Lite's
+    /// `has_spawn_info` + `Net_Spawn` position copy.
+    fn on_set_spawn_info(&mut self, payload: &[u8]) {
+        use samp_proto::events::FieldValue as F;
+        if let Some(Ok((_, values))) =
+            samp_proto::events::decode_incoming(RPC_SET_SPAWN_INFO, payload)
+        {
+            if let Some(F::Vec3(pos)) = values.get(3) {
+                tracing::debug!(x = pos.x, y = pos.y, z = pos.z, "spawn info position");
+                self.spawn_info_position = Some(*pos);
+            }
+        }
+    }
+
     /// `TogglePlayerSpectating` (RPC 124): the Arizona server toggles spectate ON during login and
     /// OFF afterwards. A `1 → 0` transition means "drop out of spectate" → spawn, exactly like
     /// RakSAMP Lite's `sub_45B260 → Net_Spawn`. This is the server-driven spawn, no explicit call.
@@ -662,6 +722,12 @@ impl<T: Transport> Driver<T> {
         let toggle = payload.iter().take(4).any(|&b| b != 0);
         let was_spectating = self.server_spectating;
         self.server_spectating = toggle;
+        if toggle {
+            // Arms the self-spawn fallback timer even when no class response will ever arrive
+            // (an Arizona script drops the automatic RequestClass, so the server's spectate-on is
+            // then the only signal that the pre-spawn window has begun).
+            self.class_selected_at.get_or_insert_with(Instant::now);
+        }
         if was_spectating && !toggle && !matches!(self.state, ConnectionState::Spawned) {
             self.spectating = false;
             self.enter_spawned().await;
@@ -669,15 +735,25 @@ impl<T: Transport> Driver<T> {
     }
 
     /// Send `RPC_Spawn` and enter the `Spawned` state — the single convergence point for every spawn
-    /// trigger. We spectate (spectator-sync 212) after join until one of these fires:
-    /// - PRIMARY: the login `DialogResponse` (RPC 62) sent while spectating sets `spawn_after_login`,
-    ///   and the `next_event` pump then calls here (the order the real Arizona client uses).
-    /// - FALLBACK: `TogglePlayerSpectating` (RPC 124) on a `1 → 0` transition (`on_toggle_spectating`),
-    ///   or `RequestSpawnResponse(allow==2)` (`on_spawn_response`) — these cover non-Arizona servers.
+    /// trigger. We spectate (spectator-sync 212) after join until one of these fires (the only
+    /// triggers the real RakSAMP Lite binary has — `Net_Spawn` xrefs at `0x455bb0`):
+    /// - `TogglePlayerSpectating` (RPC 124) on a `1 → 0` transition (`on_toggle_spectating`) — the
+    ///   Arizona post-login trigger — or `RequestSpawnResponse(allow==2)` (`on_spawn_response`).
     /// - MANUAL: `sampSpawnPlayer()` sends `RequestSpawn`, whose response then spawns us.
     async fn enter_spawned(&mut self) {
         let payload = Spawn.encode();
         self.send_rpc(RpcId::Spawn as u8, payload).await;
+        // Net_Spawn copies the SetSpawnInfo position into the local sync position — this is where the
+        // post-spawn position comes from (the class-response spawn_position is usually zero).
+        match self.spawn_info_position {
+            Some(pos) => self.sync.position = pos,
+            None => {
+                tracing::warn!(
+                    "spawning without SetSpawnInfo — using the captured fallback position"
+                );
+                self.sync.position = FALLBACK_SPAWN_POSITION;
+            }
+        }
         self.sync.health = SPAWN_HEALTH;
         self.sync.quaternion = Quaternion {
             x: 0.0,
@@ -731,8 +807,10 @@ impl<T: Transport> Driver<T> {
     /// own cadences and run every cycle.
     async fn on_sync_tick(&mut self, force: bool) {
         // Arizona pre-spawn: spectate (keepalive) while awaiting the login dialog, not on-foot sync.
+        // Also drive the 1s class/score poll that makes the server proceed to spawn.
         if self.spectating && !matches!(self.state, ConnectionState::Spawned) {
             self.send_spectator_sync().await;
+            self.send_prespawn_poll().await;
             return;
         }
         self.mirror_from_state();
@@ -819,6 +897,8 @@ impl<T: Transport> Driver<T> {
                 self.sync = OnFootSync::default();
                 self.last_sync = OnFootSync::default();
                 self.last_sync_at = None;
+                self.spawn_info_position = None;
+                self.class_selected_at = None;
                 self.transition(ConnectionState::Connecting);
             }
             Err(error) => {
@@ -862,15 +942,6 @@ impl<T: Transport> Driver<T> {
         if let Err(error) = self.transport.rpc(rpc_id, payload).await {
             tracing::warn!(rpc_id, %error, "failed to send rpc");
             self.on_disconnect(DisconnectReason::ConnectionLost);
-        }
-        // The login dialog was just answered while spectating → spawn next, the order the real client
-        // uses (deferred to the pump loop to avoid recursing through `send_rpc`).
-        if !self.closed
-            && self.spectating
-            && rpc_id == RpcId::DialogResponse as u8
-            && !matches!(self.state, ConnectionState::Spawned)
-        {
-            self.spawn_after_login = true;
         }
     }
 
@@ -1189,8 +1260,8 @@ mod tests {
         assert_eq!(driver.state(), &ConnectionState::Spawned);
 
         let log = log.lock().expect("log poisoned");
-        // Server-driven spawn (RakSAMP Lite model): we send ClientJoin + RequestClass, then the
-        // server's RequestSpawnResponse(allow==2) makes us send Spawn. We never send RequestSpawn.
+        // Server-driven spawn (RakSAMP Lite model): ClientJoin + RequestClass, then the server's
+        // RequestSpawnResponse(allow==2) makes us send Spawn. We never send RequestSpawn ourselves here.
         assert_eq!(
             log.rpc_ids(),
             vec![

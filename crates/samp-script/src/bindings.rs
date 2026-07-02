@@ -49,6 +49,24 @@ pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()>
     )?;
     let s = state.clone();
     globals.set(
+        "setBotVelocity",
+        lua.create_function(move |_, (x, y, z): (f32, f32, f32)| {
+            s.borrow_mut().on_foot.move_speed = Vector3 { x, y, z };
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    globals.set(
+        "setBotAnimation",
+        lua.create_function(move |_, (id, flags): (u16, u16)| {
+            let mut bot = s.borrow_mut();
+            bot.on_foot.animation_id = id;
+            bot.on_foot.animation_flags = flags;
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    globals.set(
         "getBotRotation",
         lua.create_function(move |_, ()| {
             // Yaw (Z) from the on-foot quaternion, in degrees.

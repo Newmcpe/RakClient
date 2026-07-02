@@ -330,6 +330,12 @@ pub struct OnFootSync {
     pub armour: u8,
     pub weapon: WeaponId,
     pub special_action: u8,
+    /// Reported velocity (moveSpeed@38). A moving `position` with a zero `move_speed` reads as a
+    /// teleport to the server's anti-cheat, so movement must set a matching velocity here.
+    pub move_speed: Vector3,
+    /// Animation index/flags (animIndex@64, animFlags@66). The real client sends a non-zero pair.
+    pub animation_id: u16,
+    pub animation_flags: u16,
 }
 
 /// On-foot sync body length in bytes (544 bits), per the on-foot branch of Net_SendInGameSync
@@ -367,19 +373,18 @@ impl Encode for OnFootSync {
         w.write_u8(self.armour);
         w.write_u8(self.weapon.0);
         w.write_u8(self.special_action);
-        // Move speed (x, y, z): unmodelled, zeroed.
-        w.write_f32(0.0);
-        w.write_f32(0.0);
-        w.write_f32(0.0);
+        // Move speed (x, y, z): the reported velocity — nonzero while the bot is moving so the
+        // server's anti-cheat sees a plausible velocity backing the position delta, not a teleport.
+        w.write_f32(self.move_speed.x);
+        w.write_f32(self.move_speed.y);
+        w.write_f32(self.move_speed.z);
         // Surfing offset (x, y, z): unmodelled, zeroed.
         w.write_f32(0.0);
         w.write_f32(0.0);
         w.write_f32(0.0);
         w.write_u16(0); // surfing vehicle id
-                        // TODO(verify): the binary writes a fixed animation pair (animIndex=0x04A5, animFlags=0x8004);
-                        // we send a neutral 0/0 since OnFootSync does not model animation state.
-        w.write_u16(0); // animation index
-        w.write_u16(0); // animation flags
+        w.write_u16(self.animation_id); // animation index (real client: 0x04A5 on foot)
+        w.write_u16(self.animation_flags); // animation flags
         w.into_bytes()
     }
 }

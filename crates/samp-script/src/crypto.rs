@@ -5,6 +5,7 @@
 //! attestation *protocol* (parse RPC 186 → reply RPC 187) lives in `luau/arizona/type3.luau`.
 //! All values are raw byte strings: hashes are 32 bytes, the resources are opaque blobs.
 
+use hmac::KeyInit;
 use hmac::{Hmac, Mac};
 use mlua::Lua;
 use sha2::{Digest, Sha256};
