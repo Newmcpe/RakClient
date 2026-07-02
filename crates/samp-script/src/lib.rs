@@ -121,14 +121,14 @@ impl ScriptEngine {
         self.lua.load(source).set_name(name).exec()
     }
 
-    /// Install `sampSendPacket(bytes)` / `sampSendRpc(id, bytes)` bound to `outbox`, letting scripts
-    /// queue raw sends the driver will flush. Use the registry's [`samp_proto::Outbox`].
     /// Install the bot getters/setters (`getBot*`/`setBot*`, `getServerAddress`, `updateSync`,
     /// `reconnect`) bound to the shared bot state the driver mirrors.
     pub fn install_bindings(&self, state: samp_client::SharedLocalPlayer) -> mlua::Result<()> {
         bindings::install_bindings(&self.lua, state)
     }
 
+    /// Install `sampSendPacket(bytes)` / `sampSendRpc(id, bytes)` bound to `outbox`, letting scripts
+    /// queue raw sends the driver will flush. Use the registry's [`samp_proto::Outbox`].
     pub fn install_sender(&self, outbox: Outbox) -> mlua::Result<()> {
         *self.outbox.borrow_mut() = outbox.clone();
         bitstream::install_bitstream(&self.lua, outbox.clone())?;

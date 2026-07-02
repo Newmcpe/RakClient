@@ -80,7 +80,7 @@ pub async fn run(socket: UdpSocket, port: u16, faults: MockFaults, sync_count: A
             }
         }
 
-        flush(&mut rel, &socket, peer, port, &faults, now).await;
+        flush(&mut rel, &socket, peer, &faults, now).await;
         if phase == Phase::Closed {
             return;
         }
@@ -165,14 +165,12 @@ async fn flush(
     rel: &mut ReliabilityLayer,
     socket: &UdpSocket,
     peer: SocketAddr,
-    port: u16,
     faults: &MockFaults,
     now: Instant,
 ) {
     if faults.silent {
         return;
     }
-    let _ = port;
     for datagram in rel.update(now) {
         // With omp encryption disabled the server replies in the clear; only inbound client
         // datagrams are ciphered.
