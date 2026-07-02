@@ -73,34 +73,29 @@ pub(crate) async fn connect(
     let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await?;
     // Direct: connect the socket to the server. Proxied: establish the SOCKS5 UDP association, connect
     // the socket to the proxy's relay, and address every datagram to the server via the SOCKS5 header.
-    let (proxy_dst, relay, proxy_control) = match &config.proxy {
+    let tunnel = match &config.proxy {
         Some(proxy) => {
             let assoc = crate::socks5::udp_associate(proxy).await?;
             // Do NOT connect the socket: a SOCKS5 relay may reply from a different source port than
             // BND.PORT, which a connected socket would drop. Send via `send_to(relay)` and accept
             // replies from the relay IP (any port).
             tracing::info!(relay = %assoc.relay, "SOCKS5 UDP association established");
-            (Some(server), Some(assoc.relay), Some(assoc.control))
+            Some(Socks5Tunnel {
+                dst: server,
+                relay: assoc.relay,
+                _control: assoc.control,
+            })
         }
         None => {
             socket.connect(server).await?;
-            (None, None, None)
+            None
         }
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
     let (evt_tx, evt_rx) = mpsc::channel(128);
 
-    let task = PeerTask::new(
-        socket,
-        server,
-        config,
-        cmd_rx,
-        evt_tx,
-        proxy_dst,
-        relay,
-        proxy_control,
-    );
+    let task = PeerTask::new(socket, server, config, cmd_rx, evt_tx, tunnel);
     tokio::spawn(task.run());
 
     Ok((RakHandle { tx: cmd_tx }, evt_rx))
@@ -138,15 +133,20 @@ struct PeerTask {
     /// Whether the open-connection request has been sent yet. Held back until the server's `SAMP`
     /// query reply confirms our IP is whitelisted through the anti-DDoS filter (or the fallback).
     open_sent: bool,
-    /// When tunnelling through a SOCKS5 proxy: the real game-server address the SOCKS5 UDP header
-    /// addresses each datagram to. `None` = direct connection.
-    proxy_dst: Option<SocketAddr>,
+    /// `Some` when tunnelling through a SOCKS5 proxy; `None` = direct connection.
+    tunnel: Option<Socks5Tunnel>,
+}
+
+/// An established SOCKS5 UDP association the peer tunnels through.
+struct Socks5Tunnel {
+    /// The real game-server address the SOCKS5 UDP header addresses each datagram to.
+    dst: SocketAddr,
     /// The proxy's UDP relay address to `send_to` (proxy mode uses an *unconnected* socket, since a
     /// relay may reply from a different source port than `BND.PORT` — a connected socket would drop
     /// those). Replies are accepted from the relay's IP on any port.
-    relay: Option<SocketAddr>,
+    relay: SocketAddr,
     /// The SOCKS5 control connection, held open so the proxy keeps the UDP association alive.
-    _proxy_control: Option<tokio::net::TcpStream>,
+    _control: tokio::net::TcpStream,
 }
 
 impl PeerTask {
@@ -156,9 +156,7 @@ impl PeerTask {
         config: RakConfig,
         cmd_rx: mpsc::Receiver<Command>,
         evt_tx: mpsc::Sender<RakEvent>,
-        proxy_dst: Option<SocketAddr>,
-        relay: Option<SocketAddr>,
-        proxy_control: Option<tokio::net::TcpStream>,
+        tunnel: Option<Socks5Tunnel>,
     ) -> Self {
         let now = Instant::now();
         PeerTask {
@@ -176,21 +174,19 @@ impl PeerTask {
             last_keepalive: now,
             last_query_ping: now - QUERY_PING_INTERVAL,
             open_sent: false,
-            proxy_dst,
-            relay,
-            _proxy_control: proxy_control,
+            tunnel,
         }
     }
 
     /// Send a datagram to the wire: directly (connected socket) when not proxying, or wrapped in the
     /// SOCKS5 UDP header (addressed to the real server) and `send_to` the proxy relay when tunnelling.
     async fn udp_send(&self, bytes: &[u8]) {
-        match (self.proxy_dst, self.relay) {
-            (Some(dst), Some(relay)) => {
-                let wrapped = crate::socks5::wrap_udp(dst, bytes);
-                let _ = self.socket.send_to(&wrapped, relay).await;
+        match &self.tunnel {
+            Some(tunnel) => {
+                let wrapped = crate::socks5::wrap_udp(tunnel.dst, bytes);
+                let _ = self.socket.send_to(&wrapped, tunnel.relay).await;
             }
-            _ => {
+            None => {
                 let _ = self.socket.send(bytes).await;
             }
         }
@@ -214,9 +210,9 @@ impl PeerTask {
                             // Proxied: accept replies from the relay IP (any port — relays reply from
                             // a port other than BND.PORT), then strip the SOCKS5 UDP header. Direct:
                             // take the datagram as-is.
-                            let datagram = match self.relay {
-                                Some(relay) => {
-                                    if from.ip() != relay.ip() {
+                            let datagram = match &self.tunnel {
+                                Some(tunnel) => {
+                                    if from.ip() != tunnel.relay.ip() {
                                         continue;
                                     }
                                     match crate::socks5::unwrap_udp(&buf[..n]) {
@@ -682,8 +678,6 @@ mod tests {
             },
             cmd_rx,
             evt_tx,
-            None,
-            None,
             None,
         );
         task.phase = Phase::Connected;

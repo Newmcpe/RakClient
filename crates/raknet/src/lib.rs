@@ -94,6 +94,20 @@ pub enum Reliability {
     ReliableSequenced = 4,
 }
 
+impl Reliability {
+    /// Map a RakNet wire reliability ordinal (`0..=4`) back to a [`Reliability`]. Unknown values
+    /// fall back to reliable-ordered, the safest choice for script-supplied traffic.
+    pub fn from_wire(value: u8) -> Self {
+        match value {
+            0 => Self::Unreliable,
+            1 => Self::UnreliableSequenced,
+            2 => Self::Reliable,
+            4 => Self::ReliableSequenced,
+            _ => Self::ReliableOrdered,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectReason {
     AttemptFailed,
@@ -105,6 +119,23 @@ pub enum DisconnectReason {
     Rejected,
     Timeout,
     Local,
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::AttemptFailed => "connection attempt failed",
+            Self::ServerFull => "server full",
+            Self::Banned => "banned",
+            Self::InvalidPassword => "invalid password",
+            Self::ClosedByServer => "closed by server",
+            Self::ConnectionLost => "connection lost",
+            Self::Rejected => "connection rejected",
+            Self::Timeout => "connection timed out",
+            Self::Local => "disconnected locally",
+        };
+        f.write_str(text)
+    }
 }
 
 /// The port-keyed SA-MP datagram cipher (`out[0] = checksum`, `out[1+i] = TABLE[data[i]]`, with odd
