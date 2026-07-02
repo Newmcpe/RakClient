@@ -55,7 +55,7 @@ fn rewrites_chain() {
 
 #[test]
 fn typed_register_decodes_struct_and_rewrites() {
-    use samp_proto::events::incoming_rpc::PlayerJoin;
+    use samp_proto::events::incoming::PlayerJoin;
 
     let seen = Rc::new(Cell::new(0u16));
     let s = seen.clone();

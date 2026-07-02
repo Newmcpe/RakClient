@@ -26,10 +26,8 @@ use std::sync::OnceLock;
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
 use crate::{Quaternion, Result, Vector2, Vector3};
 
-pub mod incoming_rpc;
-pub mod incoming_rpc_b;
-pub mod incoming_rpc_c;
-pub mod outgoing_rpc;
+pub mod incoming;
+pub mod outgoing;
 
 /// A single decoded event field, in the order it appears on the wire. This is the dynamic bridge
 /// between the typed event structs and the script layer: an event decodes to an ordered

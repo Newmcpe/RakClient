@@ -22,6 +22,12 @@ pub enum RpcId {
     /// Player chat. Client→server send body `[u8 len][text]`; server→client broadcast body
     /// `[u16 playerId LE][u8 len][text]`.
     Chat = 101,
+    /// `RPC_ScrSetSpawnInfo`: the server hands the client its spawn position; `Net_Spawn` copies it
+    /// into the local sync position at spawn time.
+    SetSpawnInfo = 68,
+    /// `RPC_ScrTogglePlayerSpectating`: `1 → 0` drops the client out of spectate (the Arizona
+    /// post-login spawn trigger).
+    TogglePlayerSpectating = 124,
     RequestClass = 128,
     RequestSpawn = 129,
     ConnectionRejected = 130,
