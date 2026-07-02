@@ -208,6 +208,70 @@ fn log_event(event: &ClientEvent) {
     }
 }
 
+async fn wire_script_engine(
+    engine: &Rc<ScriptEngine>,
+    config: ClientConfig,
+    scripts: &[PathBuf],
+    resolution: (u32, u32),
+) -> anyhow::Result<Client> {
+    let mut registry = PacketRegistry::new();
+    // Shared bot state for getBot*/setBot*, mirrored by the driver.
+    let bot_state = LocalPlayer::shared(config.nick.clone(), config.server);
+    engine
+        .install_bindings(bot_state.clone())
+        .map_err(|e| anyhow!("installing bot bindings: {e}"))?;
+    // Wire script-initiated sends and hand the script its connection context.
+    engine
+        .install_sender(registry.outbox())
+        .map_err(|e| anyhow!("installing script sender: {e}"))?;
+    let (width, height) = resolution;
+    for (key, value) in [("sampResolutionW", width), ("sampResolutionH", height)] {
+        engine
+            .set_global(key, value)
+            .map_err(|e| anyhow!("setting {key}: {e}"))?;
+    }
+    engine
+        .set_global("sampNick", config.nick.clone())
+        .map_err(|e| anyhow!("setting sampNick: {e}"))?;
+    // Load each script now that bindings/globals are in place (a script may use them on load).
+    for path in scripts {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("reading script `{}`", path.display()))?;
+        engine
+            .load_script(&source, &path.display().to_string())
+            .map_err(|e| anyhow!("loading script `{}`: {e}", path.display()))?;
+        info!(script = %path.display(), "lua script loaded");
+    }
+    // Lifecycle hooks: the script sends its own connect/init packets in FSM sequence.
+    let on_connect = engine.clone();
+    registry.on_lifecycle("onConnect", move || on_connect.fire("onConnect", ()));
+    let on_init = engine.clone();
+    registry.on_lifecycle("onInitGame", move || on_init.fire("onInitGame", ()));
+    // Route every incoming/outgoing RPC and packet through its `registerHandler` chokepoint.
+    let rpc_handler = engine.clone();
+    registry.on_any_rpc(move |direction, id, payload| {
+        let name = match direction {
+            Direction::Incoming => "onReceiveRPC",
+            Direction::Outgoing => "onSendRPC",
+        };
+        rpc_handler.dispatch_chokepoint(name, id, payload)
+    });
+    let packet_handler = engine.clone();
+    registry.on_any_packet(move |direction, id, payload| {
+        let name = match direction {
+            Direction::Incoming => "onReceivePacket",
+            Direction::Outgoing => "onSendPacket",
+        };
+        packet_handler.dispatch_chokepoint(name, id, payload)
+    });
+    // The task scheduler tick (`newTask`/`wait` run on `registerHandler('onUpdate')`).
+    let update_handler = engine.clone();
+    registry.on_update(move || update_handler.dispatch_update());
+    Client::connect_with_registry(config, registry, bot_state)
+        .await
+        .context("failed to connect to server")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -228,64 +292,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut client = match &engine {
-        Some(engine) => {
-            let mut registry = PacketRegistry::new();
-            // Shared bot state for getBot*/setBot*, mirrored by the driver.
-            let bot_state = LocalPlayer::shared(config.nick.clone(), config.server);
-            engine
-                .install_bindings(bot_state.clone())
-                .map_err(|e| anyhow!("installing bot bindings: {e}"))?;
-            // Wire script-initiated sends and hand the script its connection context.
-            engine
-                .install_sender(registry.outbox())
-                .map_err(|e| anyhow!("installing script sender: {e}"))?;
-            let (width, height) = resolution;
-            for (key, value) in [("sampResolutionW", width), ("sampResolutionH", height)] {
-                engine
-                    .set_global(key, value)
-                    .map_err(|e| anyhow!("setting {key}: {e}"))?;
-            }
-            engine
-                .set_global("sampNick", config.nick.clone())
-                .map_err(|e| anyhow!("setting sampNick: {e}"))?;
-            // Load each script now that bindings/globals are in place (a script may use them on load).
-            for path in &scripts {
-                let source = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading script `{}`", path.display()))?;
-                engine
-                    .load_script(&source, &path.display().to_string())
-                    .map_err(|e| anyhow!("loading script `{}`: {e}", path.display()))?;
-                info!(script = %path.display(), "lua script loaded");
-            }
-            // Lifecycle hooks: the script sends its own connect/init packets in FSM sequence.
-            let on_connect = engine.clone();
-            registry.on_lifecycle("onConnect", move || on_connect.fire("onConnect", ()));
-            let on_init = engine.clone();
-            registry.on_lifecycle("onInitGame", move || on_init.fire("onInitGame", ()));
-            // Route every incoming/outgoing RPC and packet through its `registerHandler` chokepoint.
-            let rpc_handler = engine.clone();
-            registry.on_any_rpc(move |direction, id, payload| {
-                let name = match direction {
-                    Direction::Incoming => "onReceiveRPC",
-                    Direction::Outgoing => "onSendRPC",
-                };
-                rpc_handler.dispatch_chokepoint(name, id, payload)
-            });
-            let packet_handler = engine.clone();
-            registry.on_any_packet(move |direction, id, payload| {
-                let name = match direction {
-                    Direction::Incoming => "onReceivePacket",
-                    Direction::Outgoing => "onSendPacket",
-                };
-                packet_handler.dispatch_chokepoint(name, id, payload)
-            });
-            // The task scheduler tick (`newTask`/`wait` run on `registerHandler('onUpdate')`).
-            let update_handler = engine.clone();
-            registry.on_update(move || update_handler.dispatch_update());
-            Client::connect_with_registry(config, registry, bot_state)
-                .await
-                .context("failed to connect to server")?
-        }
+        Some(engine) => wire_script_engine(engine, config, &scripts, resolution).await?,
         None => Client::connect(config)
             .await
             .context("failed to connect to server")?,
