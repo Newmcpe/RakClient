@@ -19,9 +19,12 @@ use tokio::sync::mpsc;
 
 mod auth_table;
 mod reliability;
+pub mod socks5;
 mod tables;
 mod transport;
 pub mod wire;
+
+pub use socks5::ProxyConfig;
 
 pub type Result<T> = std::result::Result<T, RaknetError>;
 
@@ -37,6 +40,8 @@ pub enum RaknetError {
     NotConnected,
     #[error("malformed datagram")]
     Malformed,
+    #[error("socks5 proxy error: {0}")]
+    Proxy(String),
 }
 
 impl From<samp_proto::ProtoError> for RaknetError {
@@ -178,6 +183,8 @@ pub struct RakConfig {
     pub password: Option<String>,
     /// Optional RakNet "static data" sent with the connection request.
     pub static_data: Vec<u8>,
+    /// Optional SOCKS5 proxy to tunnel the UDP game traffic through (fresh source IP).
+    pub proxy: Option<ProxyConfig>,
 }
 
 /// Cheap-to-clone handle for talking to a running [`RakPeer`].

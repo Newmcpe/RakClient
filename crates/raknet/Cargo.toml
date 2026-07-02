@@ -6,7 +6,7 @@ description = "SA-MP RakNet 3.x UDP transport: byte cipher, reliable/ordered lay
 
 [dependencies]
 samp-proto = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

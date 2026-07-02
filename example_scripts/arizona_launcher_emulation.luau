@@ -13,7 +13,9 @@ local sampev = require("samp.events")
 local arizona = require("arizona")
 
 local CLIENT_VERSION = "Arizona PC"
-local APP_VERSION = "onSvelteAppVersion|1021|3e7f1e99"
+-- Frontend build hash — rotates with launcher updates (re-derive: search the launcher's
+-- frontend.zip main.bundle.js for cef_sendClientMessage('onSvelteAppVersion', ...)).
+local APP_VERSION = "onSvelteAppVersion|1021|5a6d6aa2"
 local SERVER_HOST = "bumblebee.arizona-rp.com"
 local JOIN_VERSION = 4057
 
@@ -28,4 +30,10 @@ function sampev.onSendClientJoin(
     -- Post-join validation set (220/140, 20, 50, 38, onSvelteAppInit) fires shortly after.
     newTask(arizona.validate, 100)
     return { JOIN_VERSION, 1, nickname, challengeResponse, joinAuthKey, CLIENT_VERSION, challengeResponse2 }
+end
+
+-- Once the server accepts the join, send the entity-streamer init RPC 252 the real launcher sends
+-- before login (the server withholds login-acceptance / SetSpawnInfo without it).
+function sampev.onInitGame()
+    arizona.streamerInit()
 end

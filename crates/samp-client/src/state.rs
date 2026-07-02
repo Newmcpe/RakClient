@@ -22,6 +22,12 @@ pub struct OnFootData {
     pub armour: u8,
     pub weapon: u8,
     pub special_action: u8,
+    /// Reported velocity vector. A moving position with a zero `move_speed` is a teleport/speed-hack
+    /// signature the anti-cheat flags, so movement scripts must set a plausible velocity here.
+    pub move_speed: Vector3,
+    /// On-foot animation id/flags to report (0 id = "no animation override").
+    pub animation_id: u16,
+    pub animation_flags: u16,
 }
 
 /// In-vehicle state, present only while the bot occupies a vehicle.

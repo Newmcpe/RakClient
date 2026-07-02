@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
-use samp_client::{Client, ClientConfig, ClientEvent, Direction, LocalPlayer, PacketRegistry};
+use samp_client::{
+    Client, ClientConfig, ClientEvent, Direction, LocalPlayer, PacketRegistry, ProxyConfig,
+};
 use samp_proto::ClassId;
 use samp_script::ScriptEngine;
 use tracing::{info, warn};
@@ -57,11 +59,28 @@ struct Cli {
         default_value = "scripts"
     )]
     scripts_dir: PathBuf,
+
+    /// SOCKS5 proxy to tunnel the game UDP through (connect from the proxy's IP). Accepts either the
+    /// `host:port:user:pass` form (as in proxy.txt) or `socks5://user:pass@host:port`.
+    #[arg(long, env = "RAKCLIENT_PROXY")]
+    proxy: Option<String>,
+
+    /// Self-spawn after N seconds if the server never drives the spawn. `0` (default) = never
+    /// self-spawn: stay spectating. On Arizona an unauthorised self-spawn is kicked as suspected
+    /// cheating, so leave this off; a spectating bot still receives chat. Enable only for non-Arizona
+    /// servers that legitimately never drive the spawn.
+    #[arg(
+        long = "self-spawn-timeout",
+        env = "RAKCLIENT_SELF_SPAWN_TIMEOUT",
+        default_value_t = 0
+    )]
+    self_spawn_timeout: u64,
 }
 
 impl Cli {
     fn into_config(self) -> anyhow::Result<ClientConfig> {
         let server = resolve_server(&self.server)?;
+        let proxy = self.proxy.as_deref().map(parse_proxy).transpose()?;
         Ok(ClientConfig {
             server,
             nick: self.nick,
@@ -71,6 +90,9 @@ impl Cli {
             gpci: None,
             sync_interval: Duration::from_millis(200),
             reconnect_delay: Duration::from_secs(5),
+            self_spawn_timeout: (self.self_spawn_timeout > 0)
+                .then(|| Duration::from_secs(self.self_spawn_timeout)),
+            proxy,
         })
     }
 
@@ -82,6 +104,48 @@ impl Cli {
             .ok_or_else(|| anyhow!("resolution must be `WxH`, got `{}`", self.resolution))?;
         Ok((w.trim().parse()?, h.trim().parse()?))
     }
+}
+
+/// Parse a proxy spec into a [`ProxyConfig`]. Accepts `host:port:user:pass` (proxy.txt) or
+/// `socks5://user:pass@host:port`.
+fn parse_proxy(s: &str) -> anyhow::Result<ProxyConfig> {
+    let s = s.trim(); // strip stray CR/whitespace from a copied proxy.txt line
+    let (host, port, user, pass) = if let Some(rest) = s.strip_prefix("socks5://") {
+        let (creds, hostport) = rest
+            .rsplit_once('@')
+            .ok_or_else(|| anyhow!("socks5 url must be socks5://user:pass@host:port"))?;
+        let (user, pass) = creds
+            .split_once(':')
+            .ok_or_else(|| anyhow!("socks5 url missing user:pass"))?;
+        let (host, port) = hostport
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("socks5 url missing host:port"))?;
+        (host, port, user, pass)
+    } else {
+        // host:port:user:pass (proxy.txt) — pass keeps any trailing colons.
+        let mut it = s.splitn(4, ':');
+        let host = it.next().unwrap_or_default();
+        let port = it
+            .next()
+            .ok_or_else(|| anyhow!("proxy must be host:port:user:pass"))?;
+        let user = it
+            .next()
+            .ok_or_else(|| anyhow!("proxy must be host:port:user:pass"))?;
+        let pass = it
+            .next()
+            .ok_or_else(|| anyhow!("proxy must be host:port:user:pass"))?;
+        (host, port, user, pass)
+    };
+    let addr = format!("{host}:{port}")
+        .to_socket_addrs()
+        .with_context(|| format!("resolving proxy address `{host}:{port}`"))?
+        .next()
+        .ok_or_else(|| anyhow!("no addresses resolved for proxy `{host}:{port}`"))?;
+    Ok(ProxyConfig {
+        addr,
+        username: user.to_string(),
+        password: pass.to_string(),
+    })
 }
 
 fn resolve_server(server: &str) -> anyhow::Result<SocketAddr> {

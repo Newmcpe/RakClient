@@ -49,11 +49,16 @@ local function sendGamePath()
     bs:reset()
 end
 
+-- Byte-matched to a real captured session's order: command line, resolution, focus, client id,
+-- then the view-changed + app-init CEF pair. clientId (220/38) is sent LAST of the four.
 local function validation()
     wait(1000)
 
-    -- resolution (220/20): width, height as u32 LE, read from the host getters
+    sendGamePath()
+
     local bs = bitStream.new()
+
+    -- resolution (220/20): width, height as u32 LE, read from the host getters
     bs:writeInt8(220)
     bs:writeInt8(20)
     bs:writeInt32(sampResolutionW or 1920)
@@ -75,7 +80,8 @@ local function validation()
     bs:sendPacket()
     bs:reset()
 
-    sendGamePath()
+    sendCef("onActiveViewChanged|null")
+    sendCef("onSvelteAppInit")
 end
 
 function sampev.onSendClientJoin(
@@ -83,8 +89,8 @@ function sampev.onSendClientJoin(
     joinAuthKey: string, clientVer: string, challengeResponse2: number
 )
     newTask(validation, 100)
-    sendCef("onSvelteAppInit")
-    sendCef("onSvelteAppVersion|1.0.0|ea94b29b")
+    sendCef("onSvelteAppVersion|1021|5a6d6aa2")
+    sendCef("inventoryItemsLoaded")
     -- `joinAuthKey` is the driver's random `generate_gpci` (a valid ×1001 token) — no hardcoded key.
     return { 4057, 1, nickname, challengeResponse, joinAuthKey, "Arizona PC", challengeResponse2 }
 end

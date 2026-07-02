@@ -159,6 +159,13 @@ fn on_foot_sync_layout() {
         armour: 50,
         weapon: WeaponId(24),
         special_action: 5,
+        move_speed: Vector3 {
+            x: 0.5,
+            y: -0.5,
+            z: 0.25,
+        },
+        animation_id: 0x04A5,
+        animation_flags: 0x8004,
     };
     let body = sync.encode();
     assert_eq!(body.len(), ON_FOOT_SYNC_LEN);
@@ -178,6 +185,15 @@ fn on_foot_sync_layout() {
     assert_eq!(r.read_u8().unwrap(), 50); // armour
     assert_eq!(r.read_u8().unwrap(), 24); // weapon
     assert_eq!(r.read_u8().unwrap(), 5); // special action
+    assert_eq!(r.read_f32().unwrap(), 0.5); // move_speed.x
+    assert_eq!(r.read_f32().unwrap(), -0.5); // move_speed.y
+    assert_eq!(r.read_f32().unwrap(), 0.25); // move_speed.z
+    assert_eq!(r.read_f32().unwrap(), 0.0); // surf offset x
+    assert_eq!(r.read_f32().unwrap(), 0.0); // surf offset y
+    assert_eq!(r.read_f32().unwrap(), 0.0); // surf offset z
+    assert_eq!(r.read_u16().unwrap(), 0); // surf vehicle id
+    assert_eq!(r.read_u16().unwrap(), 0x04A5); // animation index
+    assert_eq!(r.read_u16().unwrap(), 0x8004); // animation flags
 }
 
 #[test]
