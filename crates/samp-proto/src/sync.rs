@@ -14,6 +14,24 @@ use crate::codec::{Encode, Packet};
 use crate::ids::SyncPacketId;
 use crate::{Quaternion, Result, Vector3};
 
+/// Sync packets are all sender→receiver-only (no `decode()` half is shared), so `Packet`+`Encode`
+/// reduce to the same boilerplate for every struct here; the byte-exact `decode()`/`write()` bodies
+/// stay hand-written below.
+macro_rules! sync_packet {
+    ($ty:ty, $id:expr) => {
+        impl Packet for $ty {
+            const ID: u8 = $id as u8;
+        }
+        impl Encode for $ty {
+            fn encode(&self) -> Vec<u8> {
+                let mut w = BitStreamWriter::new();
+                self.write(&mut w);
+                w.into_bytes()
+            }
+        }
+    };
+}
+
 /// `hp = min((b >> 4) * 7, 100)`, `armor = min((b & 0xF) * 7, 100)` — port of
 /// `utils.decompress_health_and_armor`.
 fn decompress_health_and_armor(byte: u8) -> (u8, u8) {
@@ -139,17 +157,7 @@ impl PlayerSyncData {
     }
 }
 
-impl Packet for PlayerSyncData {
-    const ID: u8 = SyncPacketId::PlayerSync as u8;
-}
-
-impl Encode for PlayerSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(PlayerSyncData, SyncPacketId::PlayerSync);
 
 /// In-vehicle driver sync (`ID_VEHICLE_SYNC`). `train_speed` and `trailer_id` are bool-flagged
 /// optionals in the SA-MP reader.
@@ -243,17 +251,7 @@ impl VehicleSyncData {
     }
 }
 
-impl Packet for VehicleSyncData {
-    const ID: u8 = SyncPacketId::VehicleSync as u8;
-}
-
-impl Encode for VehicleSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(VehicleSyncData, SyncPacketId::VehicleSync);
 
 /// Aim/camera sync (`AimSyncData`, 31 bytes). `cam_ext_zoom_weapon_state` packs `camExtZoom:6` in the
 /// low bits and `weaponState:2` in the high bits.
@@ -289,17 +287,7 @@ impl AimSyncData {
     }
 }
 
-impl Packet for AimSyncData {
-    const ID: u8 = SyncPacketId::AimSync as u8;
-}
-
-impl Encode for AimSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(AimSyncData, SyncPacketId::AimSync);
 
 /// Bullet/shot sync (`BulletSyncData`, 40 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -334,17 +322,7 @@ impl BulletSyncData {
     }
 }
 
-impl Packet for BulletSyncData {
-    const ID: u8 = SyncPacketId::BulletSync as u8;
-}
-
-impl Encode for BulletSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(BulletSyncData, SyncPacketId::BulletSync);
 
 /// Trailer sync (`TrailerSyncData`, 54 bytes). `quaternion` is the raw `float[4]` mapped in
 /// `x, y, z, w` order.
@@ -390,17 +368,7 @@ impl TrailerSyncData {
     }
 }
 
-impl Packet for TrailerSyncData {
-    const ID: u8 = SyncPacketId::TrailerSync as u8;
-}
-
-impl Encode for TrailerSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(TrailerSyncData, SyncPacketId::TrailerSync);
 
 /// Unoccupied-vehicle sync (`UnoccupiedSyncData`, 67 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -441,17 +409,7 @@ impl UnoccupiedSyncData {
     }
 }
 
-impl Packet for UnoccupiedSyncData {
-    const ID: u8 = SyncPacketId::UnoccupiedSync as u8;
-}
-
-impl Encode for UnoccupiedSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(UnoccupiedSyncData, SyncPacketId::UnoccupiedSync);
 
 /// In-vehicle passenger sync (`PassengerSyncData`, 24 bytes). `seat_drive_cuff` packs
 /// `seatId:6|driveBy:1|cuffed:1`; `weapon_special` packs `currentWeapon:6|specialKey:2`.
@@ -496,17 +454,7 @@ impl PassengerSyncData {
     }
 }
 
-impl Packet for PassengerSyncData {
-    const ID: u8 = SyncPacketId::PassengerSync as u8;
-}
-
-impl Encode for PassengerSyncData {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = BitStreamWriter::new();
-        self.write(&mut w);
-        w.into_bytes()
-    }
-}
+sync_packet!(PassengerSyncData, SyncPacketId::PassengerSync);
 
 #[cfg(test)]
 mod tests {
