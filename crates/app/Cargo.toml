@@ -2,7 +2,7 @@
 name = "app"
 version = "0.2.0"
 edition = "2021"
-description = "RakClient binary: connect a SA-MP client to a server and run it to Spawned."
+description = "RakClient binary: a full-featured headless SA-MP 0.3.7 client (no GTA, no rendering) — connects, logs in, spawns, syncs on-foot state, moves, and chats; scriptable via Lua/Luau."
 
 [[bin]]
 name = "rakclient"

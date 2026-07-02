@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An async Rust/Tokio reimplementation of a SA-MP 0.3.7 console client, reverse-engineered from
-`RakSAMP Lite.exe` / the Arizona client. It speaks the real "RakNet 3.x" UDP wire protocol (byte
-cipher + reliable/ordered layer) well enough to connect to live servers, drive the full
-`Connecting → Joining → Spawned` sequence, and exchange chat. The end goal is an Android↔PC chat
-bridge for Arizona servers.
+An async Rust/Tokio reimplementation of a SA-MP 0.3.7 client as a **headless bot** — no GTA San
+Andreas, no game engine, no rendering; unlike a normal SA-MP client (GTA:SA + `samp.dll`) it never
+launches the game and speaks the wire protocol directly. Reverse-engineered from `RakSAMP Lite.exe` /
+the Arizona client. It speaks the real "RakNet 3.x" UDP wire protocol (byte cipher + reliable/ordered
+layer) well enough to be a full-featured client on live servers: it drives the whole
+`Connecting → Joining → Spawned → InGame` sequence, then keeps playing — on-foot sync, movement, and
+chat — fully scriptable via Lua/Luau. The end goal is an Android↔PC chat bridge for Arizona servers.
 
 ## Commands
 

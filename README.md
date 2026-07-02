@@ -1,7 +1,9 @@
-# RakClient — async SA-MP 0.3.7 client (Rust / Tokio)
+# RakClient — headless async SA-MP 0.3.7 client (Rust / Tokio)
 
-A clean, async reimplementation of a RakSAMP-style SA-MP 0.3.7 console client, reverse-engineered
-from `RakSAMP Lite.exe`. It drives the full connection → play sequence:
+A **headless** SA-MP 0.3.7 client — a pure async network bot with **no GTA San Andreas, no game
+engine, and no rendering**. Unlike a normal SA-MP client (GTA:SA + `samp.dll`), it never launches the
+game: it speaks the wire protocol directly. Reverse-engineered from `RakSAMP Lite.exe`, it talks to a
+real 0.3.7 server and drives the full connection → play sequence:
 
 ```
 Disconnected → Connecting → RakNet-connected → Joining (ClientJoin)
