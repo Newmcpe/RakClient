@@ -10,6 +10,19 @@ fn runtime_is_luau() {
     );
 }
 
+#[test]
+fn fly_module_loads_and_exposes_api() {
+    // Smoke test that the bundled `fly` movement module parses under Luau, its `require("addon")`
+    // dependency loads, and it returns the expected public API. The movers themselves need the
+    // `getBot*`/`updateSync` bindings (installed only with a bot state), so we only probe shapes.
+    let engine = ScriptEngine::new().expect("vm");
+    engine.install_sender(empty_outbox()).expect("sender");
+    let api: String = engine
+        .eval("local fly = require('fly') return type(fly.to)..','..type(fly.distance)")
+        .expect("require fly");
+    assert_eq!(api, "function,function");
+}
+
 /// Extract the bytes of a queued `Packet`, panicking on anything else — test helper.
 fn packet_data(msg: &OutboundMsg) -> &[u8] {
     match msg {
@@ -445,15 +458,17 @@ mod type3 {
              03 04 64 00 00 00 00 20 00 04 C0 00 00 00 00 40 00 04 65 00 00 00 00 00 01 44");
         let response = hx(
             "03 C6 0D AE 70 0A 5B 82 24 42 51 D8 73 1B 3A FA 20 \
-             F8 DC 70 F0 8F 17 26 4A 3F 4D 89 19 7D 67 CB 1A 5F 34 96 94 CF 08 1A AA 8D 60 69 4C E7 22 44 69 \
+             58 07 36 C2 B5 6F CC 45 97 F6 3C 63 DA E9 3D 75 7C B5 10 CF A1 AF E5 E4 55 5B 87 D8 72 44 66 15 \
              06 00 01 00 00 00 5C 01",
         );
         (challenge, response)
     }
 
-    /// Anchors the oracle to the genuine capture: fed the real trailer, it reproduces the captured
-    /// RPC 187 byte-for-byte. (The host `sha256`/`hmacSha256` are proven equivalent to this oracle by
-    /// `handler_answers_real_challenge`.)
+    /// Anchors the oracle to the expected reply computed over the byte-verified real `core.asi`
+    /// resources (res_100/101/57024, extracted from the packed `.rsrc`). The real client's RPC 187 is
+    /// not wire-capturable — `core.asi` sends it directly via the RakNet vtable, below the SA-MP RPC
+    /// hook — so this vector is resource-derived, not a raw 187 capture. (The host `sha256`/
+    /// `hmacSha256` are proven equivalent to this oracle by `handler_answers_real_challenge`.)
     #[test]
     fn oracle_matches_real_capture() {
         let (challenge, response) = real_capture();

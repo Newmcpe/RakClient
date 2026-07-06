@@ -24,8 +24,9 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::reliability::ReliabilityLayer;
 use crate::wire::{
-    build_rpc, parse_rpc, ID_CONNECTION_REQUEST, ID_OPEN_CONNECTION_COOKIE,
-    ID_OPEN_CONNECTION_REPLY, ID_OPEN_CONNECTION_REQUEST, ID_PONG, ID_RPC, ID_TIMESTAMP,
+    build_connected_pong, build_rpc, parse_rpc, ID_CONNECTION_REQUEST, ID_INTERNAL_PING,
+    ID_OPEN_CONNECTION_COOKIE, ID_OPEN_CONNECTION_REPLY, ID_OPEN_CONNECTION_REQUEST, ID_PONG,
+    ID_RPC, ID_TIMESTAMP,
 };
 use crate::{
     cipher, Command, DisconnectReason, RakConfig, RakEvent, RakHandle, Reliability, Result,
@@ -35,6 +36,11 @@ const TICK: Duration = Duration::from_millis(20);
 const HANDSHAKE_RETRY: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(8);
+/// Once connected, if nothing arrives on the RakNet stream for this long the peer is treated as gone
+/// even without a disconnect notification — a silently dropped or frozen link. We keepalive every
+/// [`KEEPALIVE`] (8 s) and the server streams pongs/ACKs/sync constantly, so ~2 missed cycles of total
+/// silence means dead; tear down so the driver reconnects instead of sending sync into the void.
+const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Receive buffer sized for the largest possible UDP datagram (65507 B payload). Oversized reads on
 /// Windows fail the recv with `WSAEMSGSIZE` rather than truncating like Linux, so we never want a
 /// datagram to exceed this.
@@ -70,25 +76,21 @@ pub(crate) async fn connect(
     server: SocketAddr,
     config: RakConfig,
 ) -> Result<(RakHandle, mpsc::Receiver<RakEvent>)> {
-    let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await?;
-    // Direct: connect the socket to the server. Proxied: establish the SOCKS5 UDP association, connect
-    // the socket to the proxy's relay, and address every datagram to the server via the SOCKS5 header.
-    let tunnel = match &config.proxy {
-        Some(proxy) => {
-            let assoc = crate::socks5::udp_associate(proxy).await?;
-            // Do NOT connect the socket: a SOCKS5 relay may reply from a different source port than
-            // BND.PORT, which a connected socket would drop. Send via `send_to(relay)` and accept
-            // replies from the relay IP (any port).
-            tracing::info!(relay = %assoc.relay, "SOCKS5 UDP association established");
-            Some(Socks5Tunnel {
-                dst: server,
-                relay: assoc.relay,
-                _control: assoc.control,
-            })
-        }
+    // Direct: bind + connect the socket, best-effort anti-DDoS whitelist. Proxied: hunt for an exit
+    // that both whitelists on the server (HTTP :80) and relays the game UDP, rotating the session id.
+    let (socket, tunnel) = match &config.proxy {
+        Some(proxy) => establish_proxied(server, proxy).await?,
         None => {
+            let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await?;
+            if let SocketAddr::V4(v4) = server {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(6),
+                    crate::socks5::http_whitelist(*v4.ip(), None),
+                )
+                .await;
+            }
             socket.connect(server).await?;
-            None
+            (socket, None)
         }
     };
 
@@ -99,6 +101,134 @@ pub(crate) async fn connect(
     tokio::spawn(task.run());
 
     Ok((RakHandle { tx: cmd_tx }, evt_rx))
+}
+
+/// Max session rotations while hunting for a proxy exit that actually relays the game UDP.
+const MAX_PROXY_ROTATIONS: usize = 15;
+
+async fn establish_proxied(
+    server: SocketAddr,
+    proxy: &crate::socks5::ProxyConfig,
+) -> Result<(UdpSocket, Option<Socks5Tunnel>)> {
+    let rotatable = proxy.username.contains("-session-");
+    let attempts = if rotatable { MAX_PROXY_ROTATIONS } else { 1 };
+    let mut last_split: Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> = None;
+    for attempt in 0..attempts {
+        let username = if rotatable {
+            crate::socks5::rotate_session(&proxy.username, 86_400)
+        } else {
+            proxy.username.clone()
+        };
+        let cfg = crate::socks5::ProxyConfig {
+            addr: proxy.addr,
+            username,
+            password: proxy.password.clone(),
+        };
+        match probe_exit(server, &cfg).await {
+            Ok((socket, tunnel)) => {
+                tracing::info!(attempt, relay = %tunnel.relay, "proxy exit relays game UDP — using it");
+                return Ok((socket, Some(tunnel)));
+            }
+            Err(ProbeFail::SplitExit { tcp, udp }) => {
+                last_split = Some((tcp, udp));
+                tracing::warn!(
+                    attempt, %tcp, %udp,
+                    "proxy exit egresses TCP and UDP from different IPs — the whitelist covers the TCP \
+                     IP but game UDP would arrive from the UDP IP; rotating"
+                );
+            }
+            Err(ProbeFail::NoUdpRelay) => {
+                if rotatable {
+                    tracing::warn!(
+                        attempt,
+                        "proxy exit did not relay game UDP; rotating session"
+                    );
+                }
+            }
+        }
+    }
+    // A split exit is a property of the provider, not the individual exit, so if we saw one it's the
+    // real reason every rotation failed — say so explicitly instead of the generic message.
+    let msg = match last_split {
+        Some((tcp, udp)) => format!(
+            "proxy egresses TCP ({tcp}) and UDP ({udp}) from different IPs — incompatible with \
+             source-IP-whitelisting servers (e.g. Arizona); use a single-IP proxy (datacenter/ISP) \
+             that relays UDP"
+        ),
+        None => "no proxy exit relayed the game UDP after rotating sessions".to_string(),
+    };
+    Err(crate::RaknetError::Proxy(msg))
+}
+
+/// Why a proxy-exit probe was rejected, so the caller can give a precise final error instead of a
+/// generic "no exit worked".
+enum ProbeFail {
+    /// The exit egresses TCP and UDP from different IPs — the whitelisted (TCP) IP is not the one the
+    /// game UDP arrives from, so a source-IP-whitelisting server silently drops us. Rotating cannot
+    /// fix this on such a provider (e.g. SOAX residential).
+    SplitExit {
+        tcp: std::net::Ipv4Addr,
+        udp: std::net::Ipv4Addr,
+    },
+    /// The exit did not relay the game UDP at all (no query reply), or the association/whitelist
+    /// failed. Rotating to a fresh exit may help.
+    NoUdpRelay,
+}
+
+async fn probe_exit(
+    server: SocketAddr,
+    cfg: &crate::socks5::ProxyConfig,
+) -> std::result::Result<(UdpSocket, Socks5Tunnel), ProbeFail> {
+    let SocketAddr::V4(v4) = server else {
+        return Err(ProbeFail::NoUdpRelay);
+    };
+    let assoc = crate::socks5::udp_associate(cfg)
+        .await
+        .map_err(|_| ProbeFail::NoUdpRelay)?;
+    let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(|_| ProbeFail::NoUdpRelay)?;
+
+    // Before whitelisting, verify the exit egresses UDP and TCP from the *same* IP. The whitelist
+    // (HTTP :80) rides the TCP exit, but the game runs on UDP — if the provider relays UDP from a
+    // different IP (e.g. SOAX residential), the server drops our packets no matter how many sessions
+    // we rotate. Best-effort: only reject on a *confirmed* mismatch; an inconclusive probe falls
+    // through to the UDP query below, which stays the ultimate pass/fail.
+    let udp_ip = crate::socks5::stun_exit_ip(&socket, assoc.relay).await;
+    let tcp_ip = crate::socks5::tcp_exit_ip(cfg).await;
+    if let (Some(udp), Some(tcp)) = (udp_ip, tcp_ip) {
+        if udp != tcp {
+            return Err(ProbeFail::SplitExit { tcp, udp });
+        }
+        tracing::debug!(exit = %tcp, "proxy TCP+UDP share one exit IP");
+    }
+
+    // Whitelist the exit IP (best-effort; the UDP probe below is the real pass/fail).
+    let _ = tokio::time::timeout(
+        Duration::from_secs(6),
+        crate::socks5::http_whitelist(*v4.ip(), Some(cfg)),
+    )
+    .await;
+    let mut query = Vec::from(*b"SAMP");
+    query.extend_from_slice(&v4.ip().octets());
+    query.extend_from_slice(&v4.port().to_le_bytes());
+    query.push(b'i');
+    let wrapped = crate::socks5::wrap_udp(server, &query);
+    for _ in 0..4 {
+        let _ = socket.send_to(&wrapped, assoc.relay).await;
+    }
+    let mut buf = [0u8; 512];
+    match tokio::time::timeout(Duration::from_secs(4), socket.recv_from(&mut buf)).await {
+        Ok(Ok((n, from))) if n > 0 && from.ip() == assoc.relay.ip() => Ok((
+            socket,
+            Socks5Tunnel {
+                dst: server,
+                relay: assoc.relay,
+                _control: assoc.control,
+            },
+        )),
+        _ => Err(ProbeFail::NoUdpRelay),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -127,14 +257,21 @@ struct PeerTask {
     phase: Phase,
     cookie: Vec<u8>,
     deadline: Instant,
+    /// Task start, used as the epoch for the millisecond clock echoed in `ID_CONNECTED_PONG`.
+    started: Instant,
     last_handshake: Instant,
     last_keepalive: Instant,
     last_query_ping: Instant,
+    /// When we last received any real RakNet datagram from the peer (excludes `SAMP` query pongs).
+    /// Drives the connected-phase dead-peer timeout (see [`PEER_TIMEOUT`]).
+    last_recv: Instant,
     /// Whether the open-connection request has been sent yet. Held back until the server's `SAMP`
     /// query reply confirms our IP is whitelisted through the anti-DDoS filter (or the fallback).
     open_sent: bool,
     /// `Some` when tunnelling through a SOCKS5 proxy; `None` = direct connection.
     tunnel: Option<Socks5Tunnel>,
+    /// `Some` when `--pcap` is set: records every datagram (both directions) to a libpcap file.
+    pcap: Option<crate::pcap::PcapWriter>,
 }
 
 /// An established SOCKS5 UDP association the peer tunnels through.
@@ -159,6 +296,18 @@ impl PeerTask {
         tunnel: Option<Socks5Tunnel>,
     ) -> Self {
         let now = Instant::now();
+        let pcap = config.pcap.as_ref().and_then(|path| {
+            match crate::pcap::PcapWriter::create(path, server) {
+                Ok(w) => {
+                    tracing::info!(path = %path.display(), "capturing datagrams to pcap");
+                    Some(w)
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not open pcap file");
+                    None
+                }
+            }
+        });
         PeerTask {
             socket,
             server,
@@ -170,17 +319,23 @@ impl PeerTask {
             phase: Phase::OpenRequest,
             cookie: Vec::new(),
             deadline: now + CONNECT_TIMEOUT,
+            started: now,
             last_handshake: now,
             last_keepalive: now,
             last_query_ping: now - QUERY_PING_INTERVAL,
+            last_recv: now,
             open_sent: false,
             tunnel,
+            pcap,
         }
     }
 
     /// Send a datagram to the wire: directly (connected socket) when not proxying, or wrapped in the
     /// SOCKS5 UDP header (addressed to the real server) and `send_to` the proxy relay when tunnelling.
     async fn udp_send(&self, bytes: &[u8]) {
+        if let Some(pcap) = &self.pcap {
+            pcap.record(true, bytes); // outbound: client → server (byte-ciphered once connected)
+        }
         match &self.tunnel {
             Some(tunnel) => {
                 let wrapped = crate::socks5::wrap_udp(tunnel.dst, bytes);
@@ -222,6 +377,9 @@ impl PeerTask {
                                 }
                                 None => buf[..n].to_vec(),
                             };
+                            if let Some(pcap) = &self.pcap {
+                                pcap.record(false, &datagram); // inbound: server → client (plaintext)
+                            }
                             if !self.on_datagram(&datagram).await {
                                 break;
                             }
@@ -373,10 +531,25 @@ impl PeerTask {
                     self.send_open_request().await;
                 }
             }
-        } else if now.duration_since(self.last_keepalive) >= KEEPALIVE {
-            self.last_keepalive = now;
-            self.rel
-                .enqueue(&[ID_TIMESTAMP], Reliability::Unreliable, 0);
+        } else {
+            // Connected: detect a silently dropped / frozen peer. If nothing has arrived on the RakNet
+            // stream for PEER_TIMEOUT, the link is dead even though no disconnect notification came —
+            // tear down so the driver reconnects instead of pumping sync into the void forever.
+            let silent = now.duration_since(self.last_recv);
+            if silent >= PEER_TIMEOUT {
+                tracing::warn!(
+                    secs = silent.as_secs(),
+                    "peer silent past timeout — disconnecting"
+                );
+                self.emit(RakEvent::Disconnected(DisconnectReason::Timeout))
+                    .await;
+                return false;
+            }
+            if now.duration_since(self.last_keepalive) >= KEEPALIVE {
+                self.last_keepalive = now;
+                self.rel
+                    .enqueue(&[ID_TIMESTAMP], Reliability::Unreliable, 0);
+            }
         }
         self.flush_reliability(now).await;
         true
@@ -425,6 +598,10 @@ impl PeerTask {
             }
             return true;
         }
+        // Any real RakNet datagram is a life sign from the peer — reset the dead-peer timeout. (SAMP
+        // query pongs above are excluded, so a server whose game stream froze but whose query port
+        // still answers is still detected as dead.)
+        self.last_recv = Instant::now();
         let first = raw.first().copied().unwrap_or(0);
         if self.phase != Phase::Connected && is_offline_id(first) {
             tracing::trace!(dir = "in", kind = "offline", id = first, bytes = %hex(raw), "recv");
@@ -557,6 +734,17 @@ impl PeerTask {
                     true
                 }
             }
+            // Answer the server's connected-ping so it can measure our ping. RakNet handles this
+            // internally; our hand-rolled peer must replicate it or the server's ping stat stays
+            // 0xFFFF and the anti-cheat flags an unanswered client function. Enqueued unreliably on
+            // channel 0 (matching `RakPeer::RunUpdateCycle`); the next `on_tick` flush sends it.
+            ID_INTERNAL_PING => {
+                let local_ms = self.started.elapsed().as_millis() as u32;
+                if let Some(pong) = build_connected_pong(&message, local_ms) {
+                    self.rel.enqueue(&pong, Reliability::Unreliable, 0);
+                }
+                true
+            }
             _ => self.emit(RakEvent::Packet { data: message }).await,
         }
     }
@@ -601,6 +789,60 @@ mod tests {
             Some(DisconnectReason::InvalidPassword)
         );
         assert_eq!(disconnect_reason(200), None);
+    }
+
+    /// Build a connected `PeerTask` on a throwaway loopback socket for the dead-peer tests. Sends go
+    /// nowhere (the socket is unconnected), which is fine — these only exercise `on_tick`'s timeout.
+    /// The command sender is returned so the caller keeps it alive (the task holds the receiver).
+    async fn connected_task() -> (PeerTask, mpsc::Sender<Command>, mpsc::Receiver<RakEvent>) {
+        let socket = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let server: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (evt_tx, evt_rx) = mpsc::channel::<RakEvent>(4);
+        let mut task = PeerTask::new(
+            socket,
+            server,
+            RakConfig {
+                password: None,
+                static_data: Vec::new(),
+                proxy: None,
+                pcap: None,
+            },
+            cmd_rx,
+            evt_tx,
+            None,
+        );
+        task.phase = Phase::Connected;
+        (task, cmd_tx, evt_rx)
+    }
+
+    #[tokio::test]
+    async fn connected_peer_timeout_disconnects_when_silent() {
+        // A connected peer that goes silent past PEER_TIMEOUT (no datagrams, not even keepalive pongs)
+        // must be torn down with a Timeout so the driver can reconnect instead of sending into a void.
+        let (mut task, _cmd_tx, mut evt_rx) = connected_task().await;
+        task.last_recv = Instant::now() - PEER_TIMEOUT - Duration::from_secs(1);
+
+        let alive = task.on_tick().await;
+
+        assert!(!alive, "silent peer should stop the task");
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(RakEvent::Disconnected(DisconnectReason::Timeout))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connected_peer_stays_alive_when_recently_heard() {
+        let (mut task, _cmd_tx, mut evt_rx) = connected_task().await;
+        task.last_recv = Instant::now(); // just heard from the peer
+
+        let alive = task.on_tick().await;
+
+        assert!(alive, "recently-heard peer keeps running");
+        assert!(evt_rx.try_recv().is_err(), "no disconnect expected");
     }
 
     /// Drives two reliability layers across real loopback `UdpSocket`s through the cipher, with the
@@ -675,6 +917,7 @@ mod tests {
                 password: None,
                 static_data: Vec::new(),
                 proxy: None,
+                pcap: None,
             },
             cmd_rx,
             evt_tx,

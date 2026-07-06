@@ -15,8 +15,9 @@ use clap::Parser;
 use samp_client::{
     Client, ClientConfig, ClientEvent, Direction, LocalPlayer, PacketRegistry, ProxyConfig,
 };
-use samp_proto::ClassId;
+use samp_proto::{encode_cp1251, ClassId};
 use samp_script::ScriptEngine;
+use tokio::io::AsyncBufReadExt;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -60,10 +61,18 @@ struct Cli {
     )]
     scripts_dir: PathBuf,
 
-    /// SOCKS5 proxy to tunnel the game UDP through (connect from the proxy's IP). Accepts either the
-    /// `host:port:user:pass` form (as in proxy.txt) or `socks5://user:pass@host:port`.
+    /// SOCKS5 proxy to tunnel the game UDP through (connect from the proxy's IP). Accepts
+    /// `user:pass@host:port`, `socks5://user:pass@host:port`, or `host:port:user:pass`. When unset,
+    /// the first non-empty, non-`#` line of `proxy.txt` (in the working dir) is used automatically.
     #[arg(long, env = "RAKCLIENT_PROXY")]
     proxy: Option<String>,
+
+    /// Capture every RakNet datagram (both directions) to a libpcap file for debugging. Bare `--pcap`
+    /// writes a fresh per-session `rakclient-<unixsecs>.pcap` (never overwritten between runs); `--pcap
+    /// <path>` uses that exact path verbatim. Dissect it with the `dissect` bin (`cargo run -p app --bin
+    /// dissect -- <path>`); it also opens directly in Wireshark as UDP.
+    #[arg(long, num_args = 0..=1, default_missing_value = "@auto")]
+    pcap: Option<PathBuf>,
 
     /// Self-spawn after N seconds if the server never drives the spawn. `0` (default) = never
     /// self-spawn: stay spectating. On Arizona an unauthorised self-spawn is kicked as suspected
@@ -80,7 +89,26 @@ struct Cli {
 impl Cli {
     fn into_config(self) -> anyhow::Result<ClientConfig> {
         let server = resolve_server(&self.server)?;
-        let proxy = self.proxy.as_deref().map(parse_proxy).transpose()?;
+        // Explicit --proxy/env wins and is used verbatim. Otherwise claim one from proxy.txt: the
+        // claimed line is removed from the file so a concurrent/next agent can't reuse it and a dead
+        // one isn't retried (invalid/unresolvable lines are dropped too).
+        let proxy = match self.proxy {
+            Some(spec) => Some(parse_proxy(&spec)?),
+            None => claim_proxy_from_file(Path::new("proxy.txt")),
+        };
+        // Bare `--pcap` (sentinel `@auto`) → a fresh per-session file so captures are never overwritten
+        // between runs; an explicit `--pcap <path>` is used verbatim (the caller owns collisions).
+        let pcap = self.pcap.map(|p| {
+            if p.as_os_str() == "@auto" {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                PathBuf::from(format!("rakclient-{secs}.pcap"))
+            } else {
+                p
+            }
+        });
         Ok(ClientConfig {
             server,
             nick: self.nick,
@@ -93,6 +121,7 @@ impl Cli {
             self_spawn_timeout: (self.self_spawn_timeout > 0)
                 .then(|| Duration::from_secs(self.self_spawn_timeout)),
             proxy,
+            pcap,
         })
     }
 
@@ -110,16 +139,15 @@ impl Cli {
 /// `socks5://user:pass@host:port`.
 fn parse_proxy(s: &str) -> anyhow::Result<ProxyConfig> {
     let s = s.trim(); // strip stray CR/whitespace from a copied proxy.txt line
-    let (host, port, user, pass) = if let Some(rest) = s.strip_prefix("socks5://") {
-        let (creds, hostport) = rest
-            .rsplit_once('@')
-            .ok_or_else(|| anyhow!("socks5 url must be socks5://user:pass@host:port"))?;
+    let s = s.strip_prefix("socks5://").unwrap_or(s);
+    let (host, port, user, pass) = if let Some((creds, hostport)) = s.rsplit_once('@') {
+        // user:pass@host:port (also matches socks5://user:pass@host:port and the raw SOAX line)
         let (user, pass) = creds
             .split_once(':')
-            .ok_or_else(|| anyhow!("socks5 url missing user:pass"))?;
+            .ok_or_else(|| anyhow!("proxy creds must be `user:pass` in `user:pass@host:port`"))?;
         let (host, port) = hostport
             .rsplit_once(':')
-            .ok_or_else(|| anyhow!("socks5 url missing host:port"))?;
+            .ok_or_else(|| anyhow!("proxy must be `user:pass@host:port`"))?;
         (host, port, user, pass)
     } else {
         // host:port:user:pass (proxy.txt) — pass keeps any trailing colons.
@@ -148,6 +176,48 @@ fn parse_proxy(s: &str) -> anyhow::Result<ProxyConfig> {
     })
 }
 
+/// Claim (pop) the first usable proxy line from `path`, removing it from the file so a concurrent or
+/// subsequent agent can't reuse it and a dead line isn't retried. Comment (`#`) and blank lines are
+/// preserved. Malformed/unresolvable lines are dropped and the next candidate is tried; returns the
+/// parsed config, or `None` if the pool holds no usable proxy. Credentials are never logged.
+fn claim_proxy_from_file(path: &Path) -> Option<ProxyConfig> {
+    loop {
+        let content = std::fs::read_to_string(path).ok()?;
+        let lines: Vec<&str> = content.lines().collect();
+        let idx = lines.iter().position(|line| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })?;
+        let spec = lines[idx].trim().to_string();
+
+        // Rewrite the file without the claimed line (keep a trailing newline if anything remains).
+        let mut kept = lines.clone();
+        kept.remove(idx);
+        let mut rest = kept.join("\n");
+        if !rest.is_empty() {
+            rest.push('\n');
+        }
+        let removed = std::fs::write(path, &rest).is_ok();
+        if !removed {
+            warn!("could not rewrite proxy.txt; using the proxy without removing it from the pool");
+        }
+
+        match parse_proxy(&spec) {
+            Ok(cfg) => {
+                info!(addr = %cfg.addr, "claimed proxy from proxy.txt (removed from pool)");
+                return Some(cfg);
+            }
+            Err(error) => {
+                warn!(%error, "dropped an invalid proxy line from proxy.txt");
+                // If we couldn't remove it, stop to avoid re-reading the same bad line forever.
+                if !removed {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 fn resolve_server(server: &str) -> anyhow::Result<SocketAddr> {
     server
         .to_socket_addrs()
@@ -157,8 +227,35 @@ fn resolve_server(server: &str) -> anyhow::Result<SocketAddr> {
 }
 
 fn init_tracing() {
+    use tracing_subscriber::prelude::*;
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let stdout_layer = tracing_subscriber::fmt::layer();
+
+    // Also mirror every log line to a file (path from RAKCLIENT_LOG, default `rakclient.log`),
+    // truncated per run, so a session can be inspected after the fact without scraping the console.
+    // Best-effort: if the file can't be opened, fall back to stdout only.
+    let log_path = std::env::var("RAKCLIENT_LOG").unwrap_or_else(|_| "rakclient.log".to_string());
+    match std::fs::File::create(&log_path) {
+        Ok(file) => {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file));
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(stdout_layer)
+                .with(file_layer)
+                .init();
+            tracing::info!(path = %log_path, "logging to file");
+        }
+        Err(e) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(stdout_layer)
+                .init();
+            tracing::warn!(path = %log_path, error = %e, "could not open log file; stdout only");
+        }
+    }
 }
 
 /// Collect loadable Lua/Luau scripts from `dir`, sorted by name for a deterministic load order. A
@@ -187,7 +284,20 @@ fn dispatch_to_script(engine: &ScriptEngine, event: &ClientEvent) {
     match event {
         ClientEvent::Chat { player_id, text } => engine.on_chat(player_id.0, text),
         ClientEvent::ServerMessage { color, text } => engine.on_server_message(*color, text),
+        // Connection-lifecycle events → append-based chokepoints, so job scripts can auto-start on
+        // spawn (there is no local chat/command input in the headless client to trigger them).
+        ClientEvent::Connected => engine.dispatch_lifecycle("onConnect"),
+        ClientEvent::Spawned => engine.dispatch_lifecycle("onSpawn"),
+        ClientEvent::Disconnected(_) => engine.dispatch_lifecycle("onDisconnect"),
         _ => {}
+    }
+}
+
+/// Send each already-cp1251-encoded chat line as the local player. The single funnel for every
+/// outgoing chat source (stdin probe and script `drain_outgoing_chat`).
+async fn send_chat_lines(client: &mut Client, lines: impl IntoIterator<Item = Vec<u8>>) {
+    for line in lines {
+        client.send_chat(&line).await;
     }
 }
 
@@ -280,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
     let resolution = cli.resolution()?;
     let scripts = collect_scripts(&cli.scripts_dir)?;
     let config = cli.into_config()?;
-    info!(server = %config.server, nick = %config.nick, scripts = scripts.len(), "connecting");
+    info!(server = %config.server, nick = %config.nick, scripts = scripts.len(), proxy = config.proxy.is_some(), "connecting");
 
     // Build one engine for every script in the scripts dir; with none, run a vanilla client.
     let engine: Option<Rc<ScriptEngine>> = if scripts.is_empty() {
@@ -299,11 +409,48 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(state = ?client.state(), "connection task started");
 
+    // Interactive chat probe: each line typed on stdin is sent as a chat line (transcoded to
+    // cp1251), so a live session can be tested for connectivity/visibility — e.g. detecting a
+    // silent ban — by typing and watching whether it lands.
+    //
+    // Read stdin on a dedicated task that forwards lines over a channel, rather than polling
+    // `stdin.next_line()` inside the main select. The blocking console read can't be cancelled, so
+    // sitting it in the select and dropping it every loop iteration swallowed the first Ctrl-C
+    // (needing a second press). Off in its own task it never contends with signal handling.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = stdin.next_line().await {
+            if line_tx.send(line).is_err() {
+                break; // main loop gone
+            }
+        }
+    });
+    let mut stdin_open = true;
+
     loop {
         tokio::select! {
+            // Biased: Ctrl-C is checked before stdin/events so a shutdown always wins the first press.
+            biased;
             _ = tokio::signal::ctrl_c() => {
                 info!("ctrl-c received, shutting down");
                 break;
+            }
+            maybe_line = line_rx.recv(), if stdin_open => {
+                match maybe_line {
+                    Some(text) => {
+                        let text = text.trim_end_matches(['\r', '\n']);
+                        if !text.is_empty() {
+                            // No local echo: the server broadcasts our chat back and that line is
+                            // already logged. Silence here means the message never landed (mute/ban).
+                            send_chat_lines(&mut client, [encode_cp1251(text)]).await;
+                        }
+                    }
+                    None => {
+                        info!("stdin closed; chat input disabled");
+                        stdin_open = false;
+                    }
+                }
             }
             event = client.next_event() => {
                 match event {
@@ -311,9 +458,7 @@ async fn main() -> anyhow::Result<()> {
                         log_event(&event);
                         if let Some(engine) = &engine {
                             dispatch_to_script(engine, &event);
-                            for line in engine.drain_outgoing_chat() {
-                                client.send_chat(&line).await;
-                            }
+                            send_chat_lines(&mut client, engine.drain_outgoing_chat()).await;
                         }
                     }
                     None => {
@@ -389,6 +534,43 @@ mod tests {
             "127.0.0.1:7777".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(config.default_class, ClassId(3));
+    }
+
+    #[test]
+    fn parses_proxy_forms() {
+        // Raw SOAX line: user:pass@host:port (numeric host so the test doesn't hit DNS).
+        let p = parse_proxy("country-ru-session-abc:Pass123@127.0.0.1:1337").unwrap();
+        assert_eq!(p.username, "country-ru-session-abc");
+        assert_eq!(p.password, "Pass123");
+        assert_eq!(p.addr.to_string(), "127.0.0.1:1337");
+        // socks5:// prefix and the legacy host:port:user:pass form still parse.
+        let p = parse_proxy("socks5://u:p@127.0.0.1:1080").unwrap();
+        assert_eq!((p.username.as_str(), p.password.as_str()), ("u", "p"));
+        let p = parse_proxy("127.0.0.1:1080:user:pass").unwrap();
+        assert_eq!((p.username.as_str(), p.password.as_str()), ("user", "pass"));
+    }
+
+    #[test]
+    fn claim_proxy_pops_lines_and_keeps_comments() {
+        let path = std::env::temp_dir().join(format!("rakclient_proxy_{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "# pool\nu1:p1@127.0.0.1:1080\nu2:p2@127.0.0.1:1081\n",
+        )
+        .unwrap();
+
+        // Each claim pops the next usable line; the comment survives; then the pool is empty.
+        assert_eq!(
+            claim_proxy_from_file(&path).unwrap().addr.to_string(),
+            "127.0.0.1:1080"
+        );
+        assert_eq!(
+            claim_proxy_from_file(&path).unwrap().addr.to_string(),
+            "127.0.0.1:1081"
+        );
+        assert!(claim_proxy_from_file(&path).is_none());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# pool"));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

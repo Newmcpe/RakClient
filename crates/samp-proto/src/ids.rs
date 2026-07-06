@@ -43,6 +43,9 @@ pub enum SyncPacketId {
     AimSync = 203,
     /// Client→server weapon inventory snapshot (`PACKET_WEAPONS_UPDATE`).
     WeaponsUpdate = 204,
+    /// Client→server player stats (`PACKET_STATS_UPDATE`): `[i32 money][i32 drunk]`. The real client
+    /// sends it every second while spawned (`NetGame_Process` @0x10005B10).
+    StatsUpdate = 205,
     BulletSync = 206,
     PlayerSync = 207,
     MarkersSync = 208,
@@ -91,6 +94,6 @@ mod tests {
     #[test]
     fn variants_list_like_java_values() {
         assert!(RpcId::VARIANTS.contains(&RpcId::Spawn));
-        assert_eq!(SyncPacketId::VARIANTS.len(), 10);
+        assert_eq!(SyncPacketId::VARIANTS.len(), 11);
     }
 }

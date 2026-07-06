@@ -1,0 +1,12 @@
+[package]
+name = "sa-map"
+version = "0.2.0"
+edition = "2021"
+description = "GTA San Andreas map geometry: VER2 IMG archives and COL2/COL3 collision meshes."
+
+[dependencies]
+thiserror = { workspace = true }
+
+[[bin]]
+name = "samap"
+path = "src/bin/samap.rs"

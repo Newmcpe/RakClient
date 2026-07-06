@@ -179,7 +179,7 @@ async fn reaches_spawned_emitting_events_in_order() {
 #[tokio::test(start_paused = true)]
 async fn disconnect_schedules_reconnect() {
     let (transport, log) = ScriptedTransport::new(
-        vec![RakEvent::Disconnected(DisconnectReason::InvalidPassword)],
+        vec![RakEvent::Disconnected(DisconnectReason::ConnectionLost)],
         false,
     );
     let mut driver = Driver::new(test_config(), transport);
@@ -192,7 +192,7 @@ async fn disconnect_schedules_reconnect() {
         }
     }
 
-    assert_eq!(disconnect_message.as_deref(), Some("invalid password"));
+    assert_eq!(disconnect_message.as_deref(), Some("connection lost"));
     assert!(driver.reconnect_scheduled());
     assert_eq!(driver.state(), &ConnectionState::Disconnected);
 
@@ -205,6 +205,51 @@ async fn disconnect_schedules_reconnect() {
     assert_eq!(driver.state(), &ConnectionState::Connecting);
     assert!(!driver.reconnect_scheduled());
     assert_eq!(log.lock().expect("log poisoned").reconnects, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn banned_is_terminal_and_stops() {
+    // A ban must NOT reconnect: reconnecting is futile and just hammers the server. The driver closes
+    // (next_event yields None) so the app exits cleanly instead of looping.
+    let (transport, log) = ScriptedTransport::new(
+        vec![RakEvent::Disconnected(DisconnectReason::Banned)],
+        false,
+    );
+    let mut driver = Driver::new(test_config(), transport);
+
+    let mut disconnect_message = None;
+    while let Some(event) = driver.next_event().await {
+        if let ClientEvent::Disconnected(message) = event {
+            disconnect_message = Some(message);
+            break;
+        }
+    }
+
+    assert_eq!(disconnect_message.as_deref(), Some("banned"));
+    assert!(!driver.reconnect_scheduled());
+    assert!(driver.next_event().await.is_none(), "driver should close");
+    assert_eq!(log.lock().expect("log poisoned").reconnects, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_drops_stop_after_cap() {
+    // Back-to-back non-terminal drops with no stable session between them (kick loop): the driver must
+    // give up after the cap instead of reconnecting forever.
+    let script = vec![RakEvent::Disconnected(DisconnectReason::ConnectionLost); 6];
+    let (transport, _log) = ScriptedTransport::new(script, false);
+    let mut driver = Driver::new(test_config(), transport);
+
+    let mut disconnects = 0usize;
+    while let Some(event) = driver.next_event().await {
+        if matches!(event, ClientEvent::Disconnected(_)) {
+            disconnects += 1;
+        }
+    }
+
+    // MAX_RECONNECT_ATTEMPTS (5) reconnects are scheduled; the 6th drop trips the cap and closes.
+    assert_eq!(disconnects, 6);
+    assert!(!driver.reconnect_scheduled());
+    assert_eq!(driver.state(), &ConnectionState::Disconnected);
 }
 
 #[tokio::test(start_paused = true)]

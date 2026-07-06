@@ -32,10 +32,10 @@ pub use sync::{
 };
 
 pub use codec::{
-    generate_gpci, generate_gpci_seeded, parse_connect, ChatMessage, ChatOutgoing, ClientJoin,
-    Decode, DialogResponse, Encode, InitGame, OnFootSync, Packet, RequestClass,
+    generate_gpci, generate_gpci_seeded, parse_connect, ArizonaSync221, ChatMessage, ChatOutgoing,
+    ClientJoin, Decode, DialogResponse, Encode, InitGame, OnFootSync, Packet, RequestClass,
     RequestClassResponse, RequestSpawn, RequestSpawnResponse, ServerMessage, ShowDialog, Spawn,
-    SpectatorSync, ON_FOOT_SYNC_LEN,
+    SpectatorSync, StatsUpdate, ON_FOOT_SYNC_LEN,
 };
 pub use ids::{RpcId, SyncPacketId};
 #[doc(hidden)]

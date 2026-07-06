@@ -9,6 +9,8 @@
 /.idea/
 # local-only auto-loaded scripts dir (holds private credentials)
 /scripts/
+# auto-loaded SOCKS5 proxy spec (holds proxy credentials)
+/proxy.txt
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb

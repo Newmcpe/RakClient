@@ -101,6 +101,17 @@ impl ScriptEngine {
         }
     }
 
+    /// Fire the `registerHandler(name)` handlers for a connection-lifecycle event (`onConnect`,
+    /// `onSpawn`, `onDisconnect`) the driver produces outside the RPC stream. Uses the append-based
+    /// chokepoint model so multiple scripts can each observe the event (unlike single-slot `sampev`).
+    pub fn dispatch_lifecycle(&self, name: &str) {
+        for handler in self.chokepoint_handlers(name) {
+            if let Err(error) = handler.call::<()>(()) {
+                tracing::warn!(event = name, %error, "lifecycle handler error");
+            }
+        }
+    }
+
     /// Collect the Lua functions registered under a chokepoint name (in registration order).
     fn chokepoint_handlers(&self, chokepoint: &str) -> Vec<Function> {
         let Ok(table) = self.lua.globals().get::<Table>("__rakHandlers") else {
@@ -229,7 +240,9 @@ impl ScriptEngine {
     }
 }
 
-/// `print(...)` → stdout, space-joined, coercing each argument the way Lua's `tostring` would.
+/// `print(...)` → the `tracing` logger at INFO (target `lua`), so script output shares the host's
+/// timestamped/levelled log format instead of writing raw lines to stdout. Arguments are space-joined
+/// and coerced the way Lua's `tostring` would.
 fn install_print(lua: &Lua) -> mlua::Result<()> {
     let print = lua.create_function(|lua, args: Variadic<Value>| {
         let parts: Vec<String> = args
@@ -239,7 +252,7 @@ fn install_print(lua: &Lua) -> mlua::Result<()> {
                 _ => format!("{value:?}"),
             })
             .collect();
-        println!("{}", parts.join("\t"));
+        tracing::info!(target: "lua", "{}", parts.join("\t"));
         Ok(())
     })?;
     lua.globals().set("print", print)

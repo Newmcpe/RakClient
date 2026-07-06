@@ -159,8 +159,23 @@ impl PlayerSyncData {
 
 sync_packet!(PlayerSyncData, SyncPacketId::PlayerSync);
 
-/// In-vehicle driver sync (`ID_VEHICLE_SYNC`). `train_speed` and `trailer_id` are bool-flagged
+/// In-vehicle driver sync (`ID_VEHICLE_SYNC` = 200). `train_speed` and `trailer_id` are bool-flagged
 /// optionals in the SA-MP reader.
+///
+/// Field-name provenance — binary-verified against `SAMP_Packet_VehicleSync` @ samp.dll `0x1000A6B0`.
+/// Field names are the binary-verified truth (MoonLoader/SAMP.Lua legacy names in parentheses):
+///
+/// - `siren`: wire u8; only the low 6 bits (`& 0x3F`) are meaningful — no weapon field (MoonLoader: `currentWeapon`).
+/// - `landing_gear`: 1-bit flag (MoonLoader: `siren`).
+/// - `unknown_flag`: unidentified 1-bit flag (MoonLoader: `landingGear`).
+///
+/// The luau MoonLoader-compat reader keeps the legacy names; this Rust struct uses the accurate ones.
+/// Wire layout is unchanged (u8 + bit + bit).
+///
+/// NOT modeled: the SA-MP handler tolerates an optional leading `ID_TIMESTAMP` (`0x28`) preamble
+/// (`[0x28][u32 seq]`, a stale-packet counter) before the body. The transport strips `ID_TIMESTAMP`
+/// on the RPC path but not on sync packets, so an inbound 200 carrying it would desync this decoder
+/// — harmless for the on-foot chat bot, which does not decode inbound vehicle sync.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct VehicleSyncData {
     pub player_id: u16,
@@ -174,9 +189,9 @@ pub struct VehicleSyncData {
     pub vehicle_health: u16,
     pub player_health: u8,
     pub armor: u8,
-    pub current_weapon: u8,
-    pub siren: bool,
+    pub siren: u8,
     pub landing_gear: bool,
+    pub unknown_flag: bool,
     pub train_speed: Option<i32>,
     pub trailer_id: Option<u16>,
 }
@@ -193,9 +208,9 @@ impl VehicleSyncData {
         let move_speed = r.read_compressed_vector()?;
         let vehicle_health = r.read_u16()?;
         let (player_health, armor) = decompress_health_and_armor(r.read_u8()?);
-        let current_weapon = r.read_u8()?;
-        let siren = r.read_bit()?;
+        let siren = r.read_u8()?;
         let landing_gear = r.read_bit()?;
+        let unknown_flag = r.read_bit()?;
         let train_speed = if r.read_bit()? {
             Some(r.read_i32()?)
         } else {
@@ -218,9 +233,9 @@ impl VehicleSyncData {
             vehicle_health,
             player_health,
             armor,
-            current_weapon,
             siren,
             landing_gear,
+            unknown_flag,
             train_speed,
             trailer_id,
         })
@@ -237,9 +252,9 @@ impl VehicleSyncData {
         w.write_compressed_vector(self.move_speed);
         w.write_u16(self.vehicle_health);
         w.write_u8(compress_health_and_armor(self.player_health, self.armor));
-        w.write_u8(self.current_weapon);
-        w.write_bit(self.siren);
+        w.write_u8(self.siren);
         w.write_bit(self.landing_gear);
+        w.write_bit(self.unknown_flag);
         w.write_bit(self.train_speed.is_some());
         if let Some(v) = self.train_speed {
             w.write_i32(v);
@@ -571,9 +586,9 @@ mod tests {
             vehicle_health: 950,
             player_health: 91,
             armor: 49,
-            current_weapon: 0,
-            siren: true,
-            landing_gear: false,
+            siren: 0,
+            landing_gear: true,
+            unknown_flag: false,
             train_speed: Some(-123),
             trailer_id: Some(412),
         };
@@ -591,9 +606,9 @@ mod tests {
         assert_eq!(got.vehicle_health, data.vehicle_health);
         assert_eq!(got.player_health, data.player_health);
         assert_eq!(got.armor, data.armor);
-        assert_eq!(got.current_weapon, data.current_weapon);
         assert_eq!(got.siren, data.siren);
         assert_eq!(got.landing_gear, data.landing_gear);
+        assert_eq!(got.unknown_flag, data.unknown_flag);
         assert_eq!(got.train_speed, data.train_speed);
         assert_eq!(got.trailer_id, data.trailer_id);
         assert_eq!(got.position, data.position);

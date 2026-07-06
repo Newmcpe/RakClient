@@ -11,8 +11,9 @@ path = "src/main.rs"
 [dependencies]
 samp-client = { workspace = true }
 samp-proto = { workspace = true }
+raknet = { workspace = true }
 samp-script = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-std", "io-util"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

@@ -25,6 +25,36 @@ fn client_join_golden_vector() {
 }
 
 #[test]
+fn arizona_sync221_golden_vector() {
+    // Reconstruct real captured frame #2616 (Arizona 221/53, on foot at rest): entity 29 at its
+    // world position, with the rest velocity/heading. encode() must reproduce the 28 wire bytes.
+    let sync = ArizonaSync221 {
+        entity_id: 29,
+        position: crate::Vector3 {
+            x: f32::from_le_bytes([0x4F, 0xCF, 0x8D, 0x44]),
+            y: f32::from_le_bytes([0xDE, 0x10, 0xB1, 0xC4]),
+            z: f32::from_le_bytes([0xB2, 0x6D, 0x59, 0x41]),
+        },
+        timestamp_ms: u32::from_le_bytes([0xC5, 0xC6, 0x39, 0x0C]),
+        velocity: ArizonaSync221::REST_VELOCITY,
+        heading: ArizonaSync221::REST_HEADING,
+    };
+    let expected = vec![
+        0xDD, 0x35, 0x00, // packet 221, sub 53, reserved
+        0x1D, 0x00, // entity_id 29 (LE)
+        0x4F, 0xCF, 0x8D, 0x44, // pos x
+        0xDE, 0x10, 0xB1, 0xC4, // pos y
+        0xB2, 0x6D, 0x59, 0x41, // pos z
+        0xC5, 0xC6, 0x39, 0x0C, // timestamp_ms (LE)
+        0x00, 0x00, 0x00, 0x00, // velocity (rest)
+        0x7F, 0xFF, // heading 0xFF7F (LE, rest)
+        0x80, // trailer
+    ];
+    assert_eq!(sync.encode(), expected);
+    assert_eq!(sync.encode().len(), 28);
+}
+
+#[test]
 fn client_join_unmodded_byte() {
     let join = ClientJoin {
         version: SAMP_VERSION_0_3_7,
@@ -138,6 +168,22 @@ fn spawn_response_roundtrip() {
 fn empty_bodies() {
     assert!(RequestSpawn.encode().is_empty());
     assert!(Spawn.encode().is_empty());
+}
+
+#[test]
+fn stats_update_layout() {
+    // `[i32 money][i32 drunk]`, little-endian — id byte prepended by the transport.
+    let body = StatsUpdate {
+        money: 0x0201,
+        drunk_level: 0x04,
+    }
+    .encode();
+    assert_eq!(body, vec![0x01, 0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]);
+    assert_eq!(StatsUpdate::ID, 205);
+    assert_eq!(
+        StatsUpdate::default().to_packet(),
+        vec![205, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[test]

@@ -9,14 +9,13 @@
 //!   `GenerateFromFrequencyTable` algorithm (zero weights are bumped to 1; the two lowest-weight
 //!   nodes are repeatedly merged; ties insert the newer node *before* equal-weight nodes).
 //!
-//! Verification status: the frequency values are the well-known RakNet/SA-MP
-//! `englishCharacterFrequencies` and the tree-construction algorithm mirrors RakNet, but the exact
-//! output bits have **not** been byte-compared against a live SA-MP server capture in this crate.
-//! `encode_string`→`decode_string` round-trips exactly (self-consistent). If a future capture shows
-//! a mismatch, the most likely culprit is a tie-break detail in tree construction or a single
-//! frequency value.
-//
-// TODO(verify): frequency table + tree bit-output must be byte-compared against SA-MP StringCompressor.
+//! Verification status: [`FREQUENCY_TABLE`] is byte-identical to RakNet's canonical
+//! `englishCharacterFrequencies` (`Source/StringCompressor.cpp`) and the tree construction mirrors
+//! `Source/DS_HuffmanEncodingTree.cpp` exactly — insert-before-equal ties, `lesser`=left/`greater`=right
+//! on merge, left=0/right=1 root-to-leaf codes. This matters: the `\r` (idx 13) weight is **2**, not
+//! the 0→1 bump, and `\n` (idx 10) is **722**, not 723 — getting either wrong permutes the whole
+//! weight-1 leaf cluster (all 0x80-0xFF) and yields correlated mojibake (a uniform +2 byte shift on
+//! Cyrillic) even though `encode`→`decode` still round-trips self-consistently.
 
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
 
@@ -24,7 +23,7 @@ use crate::bitstream::{BitStreamReader, BitStreamWriter};
 /// Huffman tree is generated from.
 #[rustfmt::skip]
 pub const FREQUENCY_TABLE: [u32; 256] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 723, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 722, 0, 0, 2, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     11084, 58, 63, 1, 0, 31, 0, 317, 64, 64, 44, 0, 695, 62, 980, 266,
     69, 67, 56, 7, 73, 3, 14, 2, 69, 1, 167, 9, 1, 2, 25, 94,

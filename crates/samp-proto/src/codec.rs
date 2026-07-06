@@ -294,6 +294,29 @@ impl Encode for Spawn {
     }
 }
 
+/// Outgoing `PACKET_STATS_UPDATE` (205): `[i32 money][i32 drunk]` (8 bytes). The real client sends
+/// this every second while spawned (`NetGame_Process` @0x10005B10 writes the id then money and the
+/// drunk level, each as a 32-bit little-endian int, `Send` UNRELIABLE on channel 0). The id byte is
+/// prepended by the transport.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatsUpdate {
+    pub money: i32,
+    pub drunk_level: i32,
+}
+
+impl Packet for StatsUpdate {
+    const ID: u8 = SyncPacketId::StatsUpdate as u8;
+}
+
+impl Encode for StatsUpdate {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = BitStreamWriter::new();
+        w.write_i32(self.money);
+        w.write_i32(self.drunk_level);
+        w.into_bytes()
+    }
+}
+
 /// Outgoing spectator sync body (`ID_SPECTATOR_SYNC` = 212): `lrAnalog:u16, udAnalog:u16, keys:u16,
 /// position:3xf32` (18 bytes). The real Arizona client spectates — sending this — while it answers the
 /// login dialog, and only spawns afterwards; sending on-foot sync before login earns "ОШИБКА 7721".
@@ -386,6 +409,49 @@ impl Encode for OnFootSync {
         w.write_u16(self.animation_id); // animation index (real client: 0x04A5 on foot)
         w.write_u16(self.animation_flags); // animation flags
         w.into_bytes()
+    }
+}
+
+/// Arizona's custom on-foot position report (`packet 221`, sub-id `53`) — a 28-byte, byte-aligned
+/// sync the Arizona client streams alongside stock on-foot sync (207). The server anti-cheat kicks a
+/// client that never sends it ("Игнорирование функции(52 / 1)", where 52 is the inbound 221 sub-id).
+/// Layout reversed from live capture, all little-endian:
+/// `[u8 221][u8 53][u8 0][u16 entity_id][f32 x][f32 y][f32 z][u32 timestamp_ms][4B velocity]
+/// [u16 heading][u8 0x80]`. `timestamp_ms` must strictly increase (the server's replay/stall guard);
+/// `velocity`/`heading` carry the rest values ([`Self::REST_VELOCITY`]/[`Self::REST_HEADING`]) when
+/// the player is stationary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArizonaSync221 {
+    pub entity_id: u16,
+    pub position: Vector3,
+    pub timestamp_ms: u32,
+    pub velocity: [u8; 4],
+    pub heading: u16,
+}
+
+impl ArizonaSync221 {
+    /// The packet id (221) and sub-id (53) that open the body.
+    pub const PACKET_ID: u8 = 221;
+    pub const SUB_ID: u8 = 53;
+    /// Rest-state movement values (captured from a stationary real client).
+    pub const REST_VELOCITY: [u8; 4] = [0, 0, 0, 0];
+    pub const REST_HEADING: u16 = 0xFF7F;
+
+    /// Encode the 28-byte packet. The id byte is included — this is a raw packet, not an RPC body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Vec::with_capacity(28);
+        w.push(Self::PACKET_ID);
+        w.push(Self::SUB_ID);
+        w.push(0x00);
+        w.extend_from_slice(&self.entity_id.to_le_bytes());
+        w.extend_from_slice(&self.position.x.to_le_bytes());
+        w.extend_from_slice(&self.position.y.to_le_bytes());
+        w.extend_from_slice(&self.position.z.to_le_bytes());
+        w.extend_from_slice(&self.timestamp_ms.to_le_bytes());
+        w.extend_from_slice(&self.velocity);
+        w.extend_from_slice(&self.heading.to_le_bytes());
+        w.push(0x80);
+        w
     }
 }
 
@@ -546,6 +612,28 @@ impl Encode for ShowDialog {
         write_str8_bytes(&mut w, &self.button1);
         write_str8_bytes(&mut w, &self.button2);
         w.into_bytes()
+    }
+}
+
+impl ShowDialog {
+    /// Decode the dialog BODY (the info text / list rows) that [`Self::decode`] skips — it follows the
+    /// head fields and is SA-MP Huffman-encoded (StringCompressor), same as 3D-text-label text. For
+    /// list/tablist dialogs this is the selectable options, `\n`-separated. Returns raw cp1251 bytes
+    /// (empty if the head is malformed or there is no body). Kept off the hot `decode` path so the
+    /// structural response path stays allocation-light.
+    pub fn body(payload: &[u8]) -> Vec<u8> {
+        // The head is byte-aligned: `[u16 dialogId][u8 style][u8 tLen][title][u8 b1Len][b1][u8 b2Len]
+        // [b2]`. Walk it by byte offset to find where the body starts, then Huffman-decode the rest
+        // (the same StringCompressor `decode_string` that `readEncoded` uses).
+        let mut off = 3usize; // [u16 dialog_id] + [u8 style]
+        for _ in 0..3 {
+            let len = match payload.get(off) {
+                Some(&l) => l as usize,
+                None => return Vec::new(),
+            };
+            off += 1 + len;
+        }
+        crate::encoded::decode_string(payload.get(off..).unwrap_or(&[]), 4096)
     }
 }
 

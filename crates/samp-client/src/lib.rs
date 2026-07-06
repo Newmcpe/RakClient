@@ -65,6 +65,8 @@ pub struct ClientConfig {
     pub self_spawn_timeout: Option<Duration>,
     /// Optional SOCKS5 proxy to tunnel the UDP game traffic through (fresh source IP).
     pub proxy: Option<raknet::ProxyConfig>,
+    /// When set, capture every RakNet datagram (both directions) to this libpcap file for debugging.
+    pub pcap: Option<std::path::PathBuf>,
 }
 
 impl ClientConfig {
@@ -81,6 +83,7 @@ impl ClientConfig {
                 reconnect_delay: Duration::from_secs(5),
                 self_spawn_timeout: None,
                 proxy: None,
+                pcap: None,
             },
         }
     }
@@ -177,6 +180,7 @@ impl Client {
             password: config.password.clone(),
             static_data: Vec::new(),
             proxy: config.proxy.clone(),
+            pcap: config.pcap.clone(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
         let driver = driver::Driver::new(config, transport);
@@ -196,6 +200,7 @@ impl Client {
             password: config.password.clone(),
             static_data: Vec::new(),
             proxy: config.proxy.clone(),
+            pcap: config.pcap.clone(),
         };
         let transport = transport::RakTransport::connect(config.server, rak_config).await?;
         let driver = driver::Driver::new(config, transport)

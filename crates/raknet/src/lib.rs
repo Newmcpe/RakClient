@@ -18,12 +18,14 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 mod auth_table;
+mod pcap;
 mod reliability;
 pub mod socks5;
 mod tables;
 mod transport;
 pub mod wire;
 
+pub use reliability::{dissect_datagram, DissectedMessage};
 pub use socks5::ProxyConfig;
 
 pub type Result<T> = std::result::Result<T, RaknetError>;
@@ -216,6 +218,8 @@ pub struct RakConfig {
     pub static_data: Vec<u8>,
     /// Optional SOCKS5 proxy to tunnel the UDP game traffic through (fresh source IP).
     pub proxy: Option<ProxyConfig>,
+    /// When set, capture every RakNet datagram (both directions) to this libpcap file for debugging.
+    pub pcap: Option<std::path::PathBuf>,
 }
 
 /// Cheap-to-clone handle for talking to a running [`RakPeer`].

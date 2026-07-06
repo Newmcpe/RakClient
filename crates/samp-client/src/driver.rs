@@ -19,10 +19,10 @@ use samp_proto::events::incoming::{
     SetSpawnInfo, TogglePlayerSpectating,
 };
 use samp_proto::{
-    ChatMessage, ChatOutgoing, ClientJoin, Decode, Direction, Encode, InitGame, OnFootSync,
-    OutboundMsg, PlayerId, Quaternion, RequestClass, RequestClassResponse, RequestSpawn,
-    RequestSpawnResponse, RpcId, ServerMessage, Spawn, SpectatorSync, SyncPacketId, Vector3,
-    Verdict, WeaponId, CHALLENGE_XOR, SAMP_VERSION_0_3_7,
+    ArizonaSync221, ChatMessage, ChatOutgoing, ClientJoin, Decode, Direction, Encode, InitGame,
+    OnFootSync, OutboundMsg, PlayerId, Quaternion, RequestClass, RequestClassResponse,
+    RequestSpawn, RequestSpawnResponse, RpcId, ServerMessage, Spawn, SpectatorSync, StatsUpdate,
+    SyncPacketId, Vector3, Verdict, WeaponId, CHALLENGE_XOR, SAMP_VERSION_0_3_7,
 };
 use tokio::time::{self, Interval, MissedTickBehavior, Sleep};
 
@@ -37,13 +37,33 @@ use crate::{ClientConfig, ClientEvent, ConnectionState};
 const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// When the bot's on-foot state is unchanged, resend a keepalive sync at most this often instead of
-/// every `sync_interval` tick — a stationary bridge bot barely moves, so this cuts steady-state CPU
-/// and bandwidth while still proving liveness to the server.
-const IDLE_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+/// every `sync_interval` tick. Matches the real client's floor: samp.dll's on-foot/aim senders
+/// (`sub_10004D40`/`sub_10005040`) force a resend once `GetTickCount - last > 0x1F4` (500 ms) even when
+/// the packet is byte-identical, so a stationary player still reports at ≥2 Hz.
+const IDLE_SYNC_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the client reports its stats (`PACKET_STATS_UPDATE` = 205, money + drunk) while spawned.
+/// The real client sends this every second (`NetGame_Process` gate `TickCount - last > 0x3E8`).
+const STATS_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Base offset for the Arizona 221/53 `timestamp_ms` so it resembles a plausible `GetTickCount` uptime
+/// (the server only requires it to strictly increase within a session); the elapsed ms are added on.
+const ARIZONA_TS_BASE: u32 = 200_000_000;
+
+/// RakNet ordering channel for all player sync (on-foot 207, aim 203, spectator 212). The real client
+/// sends sync on channel 1, keeping it off channel 0 which carries the reliable-ordered RPC stream —
+/// verified against samp.dll's sync senders (`sub_10004D40`/`sub_10005040`/`sub_10006320`, all
+/// `Send(..., orderingChannel = 1)`). We previously sent sync on channel 0, mixing it with RPCs.
+const SYNC_CHANNEL: u8 = 1;
 
 /// Arizona's CEF/validation packet family: raw packet id 220, sub-id in the second byte. Logged
 /// verbosely in both directions because the Arizona login flow hinges on it.
 const ARIZONA_CEF_PACKET_ID: u8 = 220;
+
+/// Arizona's custom streamer-sync packet id (221). Sub-id 53 = our outbound position report; sub-id
+/// 113 = the server assigning us the streamer entity id to report under.
+const ARIZONA_SYNC_PACKET_ID: u8 = 221;
+const ARIZONA_SYNC_ASSIGN_SUB: u8 = 113;
 
 const SPAWN_HEALTH: u8 = 100;
 
@@ -76,6 +96,8 @@ pub(crate) struct Driver<T: Transport> {
     /// state change, otherwise at the slow idle keepalive cadence).
     last_sync: OnFootSync,
     last_sync_at: Option<Instant>,
+    /// When the periodic `PACKET_STATS_UPDATE` (205) was last sent; drives the 1 Hz stats cadence.
+    last_stats_at: Option<Instant>,
     sync_timer: Option<Interval>,
     reconnect_timer: Option<Pin<Box<Sleep>>>,
     closed: bool,
@@ -105,7 +127,26 @@ pub(crate) struct Driver<T: Transport> {
     /// When the pre-spawn window began — the class response or the server's spectate-on toggle,
     /// whichever lands first; drives the optional self-spawn fallback (`config.self_spawn_timeout`).
     class_selected_at: Option<Instant>,
+    /// Driver-creation instant; the monotonic base for the Arizona 221/53 `timestamp_ms` field.
+    created_at: Instant,
+    /// Streamer entity id the server assigns us via inbound `221/113` (`[0xDD][0x71][0x00][u16 id]`).
+    /// Our outbound `221/53` sync must report THIS id, not our SA-MP player id, or the server's
+    /// streamer watchdog treats the entity's sync as ignored ("Игнорирование функции(52 / 1)").
+    arizona_streamer_id: Option<u16>,
+    /// Consecutive reconnect attempts since the last stable session. Caps a kick/reject loop so a
+    /// server that keeps dropping us right back out doesn't spin the client forever.
+    reconnect_attempts: u32,
+    /// When we last reached a stable in-game state (`Spawned`). A session that survived at least
+    /// [`STABLE_SESSION`] before dropping resets the attempt cap — a genuine one-off disconnect
+    /// reconnects freely, while a spawn→instant-kick loop keeps accumulating toward the cap.
+    connected_since: Option<Instant>,
 }
+
+/// Give up reconnecting after this many consecutive attempts without a stable session — the drop is a
+/// kick/ban/block that reconnecting won't fix, so stop instead of looping.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// A session must last at least this long (spawned) to count as "stable" and reset the attempt cap.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
 
 impl<T: Transport> Driver<T> {
     pub(crate) fn new(config: ClientConfig, transport: T) -> Self {
@@ -126,6 +167,7 @@ impl<T: Transport> Driver<T> {
             sync: OnFootSync::default(),
             last_sync: OnFootSync::default(),
             last_sync_at: None,
+            last_stats_at: None,
             sync_timer: None,
             reconnect_timer: None,
             closed: false,
@@ -139,6 +181,10 @@ impl<T: Transport> Driver<T> {
             server_spectating: false,
             spawn_info_position: None,
             class_selected_at: None,
+            created_at: Instant::now(),
+            arizona_streamer_id: None,
+            reconnect_attempts: 0,
+            connected_since: None,
         }
     }
 
@@ -281,6 +327,9 @@ impl<T: Transport> Driver<T> {
             let s = state.borrow();
             self.sync.position = s.on_foot.position;
             self.sync.quaternion = s.on_foot.quaternion;
+            // Script-driven keypresses (e.g. an Arizona ALT interaction): the server derives
+            // OnPlayerKeyStateChange from this field, so a script pulses `setBotKeys(mask)` then 0.
+            self.sync.keys = s.on_foot.keys;
             self.sync.health = s.on_foot.health;
             self.sync.armour = s.on_foot.armour;
             self.sync.weapon = WeaponId(s.on_foot.weapon);
@@ -407,6 +456,29 @@ impl<T: Transport> Driver<T> {
         if let Some(decoded) = decode_inbound_rpc(id, payload) {
             tracing::debug!(target: "samp_client::driver", "  └─ {decoded}");
         }
+        // Surface incoming dialogs in the console at info level (like server chat), independent of any
+        // script — so every ShowDialog the server sends is visible without enabling debug logging.
+        if id == RpcId::ShowDialog as u8 {
+            if let Ok(d) = samp_proto::ShowDialog::decode(payload) {
+                // Body holds the info text / list rows (options) for list/tablist dialogs; show them
+                // indented under the header, one per line, so list dialogs are readable in the console.
+                let body = samp_proto::decode_cp1251(&samp_proto::ShowDialog::body(payload));
+                let options: String = body
+                    .split('\n')
+                    .filter(|row| !row.trim().is_empty())
+                    .map(|row| format!("\n    • {}", row.trim_end()))
+                    .collect();
+                tracing::info!(
+                    "dialog #{} (style {}): {:?}  [{} | {}]{}",
+                    d.dialog_id,
+                    d.style,
+                    samp_proto::decode_cp1251(&d.title),
+                    samp_proto::decode_cp1251(&d.button1),
+                    samp_proto::decode_cp1251(&d.button2),
+                    options,
+                );
+            }
+        }
         // Registered handlers (scripts/observers) see the RPC first: a Drop consumes it before the
         // FSM, a Rewrite swaps the body the FSM then processes.
         let rewritten;
@@ -436,7 +508,7 @@ impl<T: Transport> Driver<T> {
                 ConnectionState::ClassSelection | ConnectionState::ClassSelected,
             ) => self.on_spawn_response(payload).await,
             (Ok(RpcId::TogglePlayerSpectating), _) => self.on_toggle_spectating(payload).await,
-            (Ok(RpcId::SetSpawnInfo), _) => self.on_set_spawn_info(payload),
+            (Ok(RpcId::SetSpawnInfo), _) => self.on_set_spawn_info(payload).await,
             (Ok(RpcId::ConnectionRejected), _) => self.on_disconnect(DisconnectReason::Rejected),
             (Ok(RpcId::ClientMessage), _) => self.on_client_message(payload),
             (Ok(RpcId::Chat), _) => self.on_player_chat(payload),
@@ -545,6 +617,16 @@ impl<T: Transport> Driver<T> {
             return;
         };
         tracing::debug!(packet_id = id, len = data.len(), "inbound packet");
+        // Arizona 221/113 assigns our streamer entity id — capture it for the outbound 221/53 sync.
+        if id == ARIZONA_SYNC_PACKET_ID && data.get(1) == Some(&ARIZONA_SYNC_ASSIGN_SUB) {
+            if let (Some(&lo), Some(&hi)) = (data.get(3), data.get(4)) {
+                let entity = u16::from_le_bytes([lo, hi]);
+                if self.arizona_streamer_id != Some(entity) {
+                    tracing::info!(entity, "arizona: assigned streamer entity id (221/113)");
+                }
+                self.arizona_streamer_id = Some(entity);
+            }
+        }
         if id == ARIZONA_CEF_PACKET_ID {
             tracing::debug!(
                 sub_id = data.get(1).copied().unwrap_or(0),
@@ -698,13 +780,33 @@ impl<T: Transport> Driver<T> {
 
     /// `SetSpawnInfo` (RPC 68): remember the spawn position for `enter_spawned`, like RakSAMP Lite's
     /// `has_spawn_info` + `Net_Spawn` position copy.
-    fn on_set_spawn_info(&mut self, payload: &[u8]) {
+    async fn on_set_spawn_info(&mut self, payload: &[u8]) {
         let Some(info) = decode_event_or_warn::<SetSpawnInfo>(payload, "spawn info") else {
             return;
         };
         let pos = info.position;
         tracing::debug!(x = pos.x, y = pos.y, z = pos.z, "spawn info position");
         self.spawn_info_position = Some(pos);
+        // The real client answers EVERY SetSpawnInfo with RPC 52 (Spawn) — including the SECOND one the
+        // server sends right after a fresh account confirms its skin (`chooseSelector.buy`). That second
+        // Spawn is what moves the character out of the ChooseSelector room (interior 211) into the world;
+        // NOT sending it is exactly the "Игнорирование функции(52 / 1)" anti-cheat kick. The FIRST
+        // SetSpawnInfo arrives while still spectating (not yet Spawned) and is driven by the normal
+        // class/spawn-response path, so only re-send when we're ALREADY Spawned (the post-skin / respawn
+        // case). Re-send Spawn and adopt the new position, but don't re-fire the Spawned event — the FSM
+        // is already Spawned and the scripts' onSpawn already ran.
+        if matches!(self.state, ConnectionState::Spawned) {
+            let spawn = Spawn.encode();
+            self.send_rpc(RpcId::Spawn as u8, spawn).await;
+            self.sync.position = pos;
+            self.mirror_to_state();
+            tracing::info!(
+                x = pos.x,
+                y = pos.y,
+                z = pos.z,
+                "re-spawn (RPC 52) on post-skin SetSpawnInfo"
+            );
+        }
     }
 
     /// `TogglePlayerSpectating` (RPC 124): the Arizona server toggles spectate ON during login and
@@ -726,8 +828,13 @@ impl<T: Transport> Driver<T> {
             self.class_selected_at.get_or_insert_with(Instant::now);
         }
         if was_spectating && !toggle && !matches!(self.state, ConnectionState::Spawned) {
-            self.spectating = false;
-            self.enter_spawned().await;
+            // RakSAMP Lite (`network_transport.cpp`): a `1 → 0` spectate toggle routes through
+            // `RequestSpawn` (RPC 129), NOT a direct `Spawn` (RPC 52). The server then replies
+            // `RequestSpawnResponse` with `allow != 0`, which drives `enter_spawned`. Sending an
+            // unsolicited `Spawn` (skipping the RequestSpawn→allow handshake) is what Arizona's
+            // anti-cheat flags as "Игнорирование функции(52 / 1)" and kicks ~16s after spawn. Stay
+            // spectating until the server's spawn grant arrives.
+            self.request_spawn().await;
         }
     }
 
@@ -776,9 +883,11 @@ impl<T: Transport> Driver<T> {
             position: self.sync.position,
         }
         .to_packet();
+        // The real client sends spectator sync UNRELIABLE (reliability 6, not sequenced) on the sync
+        // channel — samp.dll `sub_10006320`, `Send(..., reliability = 6, orderingChannel = 1)`.
         if let Err(error) = self
             .transport
-            .send(packet, Reliability::UnreliableSequenced, 0)
+            .send(packet, Reliability::Unreliable, SYNC_CHANNEL)
             .await
         {
             tracing::warn!(%error, "failed to send spectator sync");
@@ -813,8 +922,60 @@ impl<T: Transport> Driver<T> {
         self.mirror_from_state();
         self.adjust_on_foot_from_emulation();
         self.send_on_foot_sync(force).await?;
+        self.send_arizona_221_sync().await?;
         self.send_weapons_update().await?;
+        self.send_stats_update().await?;
         self.send_aim_sync().await
+    }
+
+    /// Stream Arizona's custom on-foot position report (packet 221, sub-id 53) alongside stock 207.
+    /// Arizona's anti-cheat kicks a client that never sends it ("Игнорирование функции(52 / 1)"). This
+    /// is the minimal stationary form: our own entity id + current position + a monotonic ms timestamp
+    /// + the rest velocity/heading. Sent `UnreliableSequenced` on [`SYNC_CHANNEL`] like the other sync.
+    async fn send_arizona_221_sync(&mut self) -> raknet::Result<()> {
+        // Report the server-assigned streamer id (from 221/113); fall back to our player id until it
+        // arrives. Reporting the wrong id is what the streamer watchdog flags as "function 52".
+        let packet = ArizonaSync221 {
+            entity_id: self.arizona_streamer_id.unwrap_or(self.local_id.0),
+            position: self.sync.position,
+            timestamp_ms: ARIZONA_TS_BASE
+                .wrapping_add(self.created_at.elapsed().as_millis() as u32),
+            velocity: ArizonaSync221::REST_VELOCITY,
+            heading: ArizonaSync221::REST_HEADING,
+        }
+        .encode();
+        self.transport
+            .send(packet, Reliability::UnreliableSequenced, SYNC_CHANNEL)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "failed to send Arizona 221 sync"))
+    }
+
+    /// Report player stats (`PACKET_STATS_UPDATE` = 205: money + drunk) at the [`STATS_INTERVAL`]
+    /// cadence, matching the real client's 1 Hz stats send while spawned. Sent UNRELIABLE on channel 0
+    /// like the real client (`NetGame_Process` @0x10005B10); drunk level is always 0 (headless bot).
+    async fn send_stats_update(&mut self) -> raknet::Result<()> {
+        let now = Instant::now();
+        if self
+            .last_stats_at
+            .is_some_and(|at| now.duration_since(at) < STATS_INTERVAL)
+        {
+            return Ok(());
+        }
+        let money = self
+            .bot_state
+            .as_ref()
+            .map_or(0, |state| state.borrow().money);
+        let packet = StatsUpdate {
+            money,
+            drunk_level: 0,
+        }
+        .to_packet();
+        self.transport
+            .send(packet, Reliability::Unreliable, 0)
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "failed to send stats update"))?;
+        self.last_stats_at = Some(now);
+        Ok(())
     }
 
     /// Emulation adjustments folded into the outgoing on-foot state: report the held weapon and the
@@ -855,7 +1016,7 @@ impl<T: Transport> Driver<T> {
         };
         if let Some(packet) = to_send {
             self.transport
-                .send(packet, Reliability::UnreliableSequenced, 0)
+                .send(packet, Reliability::UnreliableSequenced, SYNC_CHANNEL)
                 .await
                 .inspect_err(|error| tracing::warn!(%error, "failed to send on-foot sync"))?;
             self.last_sync = self.sync;
@@ -897,7 +1058,7 @@ impl<T: Transport> Driver<T> {
         match aim_packet {
             Some(packet) => self
                 .transport
-                .send(packet, Reliability::UnreliableSequenced, 0)
+                .send(packet, Reliability::UnreliableSequenced, SYNC_CHANNEL)
                 .await
                 .inspect_err(|error| tracing::warn!(%error, "failed to send aim sync")),
             None => Ok(()),
@@ -913,6 +1074,7 @@ impl<T: Transport> Driver<T> {
                 self.sync = OnFootSync::default();
                 self.last_sync = OnFootSync::default();
                 self.last_sync_at = None;
+                self.last_stats_at = None;
                 self.spawn_info_position = None;
                 self.class_selected_at = None;
                 self.transition(ConnectionState::Connecting);
@@ -939,9 +1101,53 @@ impl<T: Transport> Driver<T> {
         self.transition(ConnectionState::Disconnected);
         self.pending
             .push_back(ClientEvent::Disconnected(reason.to_string()));
-        if reason != DisconnectReason::Local {
-            self.schedule_reconnect();
+
+        // Local quit: never reconnect.
+        if reason == DisconnectReason::Local {
+            return;
         }
+
+        // Terminal reasons: reconnecting is futile, and for a ban it just hammers the server. Stop the
+        // client cleanly (closed → next_event yields None → the app loop exits) instead of looping.
+        if matches!(
+            reason,
+            DisconnectReason::Banned | DisconnectReason::InvalidPassword
+        ) {
+            tracing::warn!(reason = %reason, "terminal disconnect — not reconnecting; stopping");
+            self.reconnect_timer = None;
+            self.closed = true;
+            return;
+        }
+
+        // Everything else (kick / rejection / connection loss / timeout) is retried, but with a cap so a
+        // server that keeps dropping us straight back out can't spin forever. A session that survived at
+        // least STABLE_SESSION before dropping is treated as a one-off and resets the counter; a
+        // never-stabilising loop (kicked before/at spawn, or spawn→instant-kick) keeps accumulating.
+        let was_stable = self
+            .connected_since
+            .is_some_and(|since| since.elapsed() >= STABLE_SESSION);
+        if was_stable {
+            self.reconnect_attempts = 0;
+        }
+        self.connected_since = None;
+        self.reconnect_attempts += 1;
+        if self.reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+            tracing::warn!(
+                attempts = self.reconnect_attempts,
+                reason = %reason,
+                "giving up after repeated reconnects (kicked/blocked) — stopping"
+            );
+            self.reconnect_timer = None;
+            self.closed = true;
+            return;
+        }
+        tracing::info!(
+            attempt = self.reconnect_attempts,
+            max = MAX_RECONNECT_ATTEMPTS,
+            reason = %reason,
+            "scheduling reconnect"
+        );
+        self.schedule_reconnect();
     }
 
     async fn send_rpc(&mut self, rpc_id: u8, payload: Vec<u8>) {
@@ -970,6 +1176,11 @@ impl<T: Transport> Driver<T> {
 
     fn transition(&mut self, next: ConnectionState) {
         self.state = next.clone();
+        // Reaching Spawned is a stable milestone: start the session clock so a long, healthy session
+        // resets the reconnect-attempt cap when it eventually drops (see on_disconnect).
+        if matches!(self.state, ConnectionState::Spawned) {
+            self.connected_since = Some(Instant::now());
+        }
         // Arm the sync tick while Spawned (on-foot sync) OR during the Arizona pre-spawn spectate
         // phase (spectator sync keepalive while waiting for the server to drive the spawn).
         if matches!(self.state, ConnectionState::Spawned) || self.spectating {

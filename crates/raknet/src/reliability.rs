@@ -202,6 +202,54 @@ fn decode_packet(r: &mut BitStreamReader<'_>) -> Result<DecodedPacket> {
     })
 }
 
+/// One internal message pulled out of a datagram by the offline `--pcap` dissector — raw, with no
+/// dedup/ordering/reassembly (the payload is `[message id][body]`, or a split fragment).
+pub struct DissectedMessage {
+    pub message_number: u32,
+    pub reliability: Reliability,
+    pub split: bool,
+    pub payload: Vec<u8>,
+}
+
+/// Parse a PLAINTEXT reliability-framed datagram into `(ack_ranges, messages)` for offline tooling
+/// (the `--pcap` dissector). Best-effort: stops at the first malformed packet. Mirrors [`ReliabilityLayer::on_receive`]'s
+/// read but keeps every message (no dedup/ordering) and never mutates state.
+pub fn dissect_datagram(datagram: &[u8]) -> (Vec<(u32, u32)>, Vec<DissectedMessage>) {
+    let mut r = BitStreamReader::new(datagram);
+    let mut acks = Vec::new();
+    if r.read_bit().unwrap_or(false) {
+        if let Ok(count) = r.read_compressed_u16() {
+            for _ in 0..count {
+                let (Ok(is_single), Ok(min)) = (r.read_bit(), r.read_u16()) else {
+                    break;
+                };
+                let max = if is_single {
+                    min
+                } else {
+                    match r.read_u16() {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    }
+                };
+                acks.push((min as u32, max as u32));
+            }
+        }
+    }
+    let mut msgs = Vec::new();
+    while r.bits_left() >= 16 {
+        match decode_packet(&mut r) {
+            Ok(p) => msgs.push(DissectedMessage {
+                message_number: p.message_number,
+                reliability: p.reliability,
+                split: p.split.is_some(),
+                payload: p.payload,
+            }),
+            Err(_) => break,
+        }
+    }
+    (acks, msgs)
+}
+
 struct ResendEntry {
     packet: OutPacket,
     last_sent: Instant,

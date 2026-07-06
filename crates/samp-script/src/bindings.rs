@@ -57,6 +57,21 @@ pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()>
     )?;
     let s = state.clone();
     globals.set(
+        "setBotKeys",
+        lua.create_function(move |_, keys: u16| {
+            // Set the on-foot key bitmask the next sync reports; the server turns it into
+            // OnPlayerKeyStateChange. Pulse (mask → updateSync → 0 → updateSync) to emulate a press.
+            s.borrow_mut().on_foot.keys = keys;
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    globals.set(
+        "getBotKeys",
+        lua.create_function(move |_, ()| Ok(s.borrow().on_foot.keys))?,
+    )?;
+    let s = state.clone();
+    globals.set(
         "setBotAnimation",
         lua.create_function(move |_, (id, flags): (u16, u16)| {
             let mut bot = s.borrow_mut();
@@ -98,6 +113,22 @@ pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()>
         })?,
     )?;
 
+    let s = state.clone();
+    globals.set(
+        "getBotWeapon",
+        lua.create_function(move |_, ()| Ok(s.borrow().weapons.current as i32))?,
+    )?;
+    let s = state.clone();
+    globals.set(
+        "setBotWeapon",
+        // Arm a weapon so the on-foot sync reports it (e.g. the rented chainsaw, id 9). `give` puts it
+        // in its slot AND makes it current; the driver's `adjust_on_foot` reports `weapons.current`.
+        // Server-side interactions that require the weapon in hand (the лесопилка chop) then fire.
+        lua.create_function(move |_, (id, ammo): (u8, Option<u16>)| {
+            s.borrow_mut().weapons.give(id, ammo.unwrap_or(1));
+            Ok(())
+        })?,
+    )?;
     let s = state.clone();
     globals.set(
         "getBotMoney",

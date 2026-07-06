@@ -73,6 +73,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "raknet",
  "samp-client",
  "samp-proto",
  "samp-script",
@@ -807,6 +808,13 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "sa-map"
+version = "0.2.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
