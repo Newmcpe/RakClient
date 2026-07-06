@@ -8,9 +8,14 @@ description = "Bevy flythrough of the parsed GTA SA collision geometry (sa-map).
 
 [dependencies]
 sa-map = { path = "../sa-map" }
+sa-nav = { path = "../sa-nav" }
 bevy = "0.15"
 
 [workspace]
+
+# NOTE: sa-viewer depends on sa-nav WITHOUT its `build` feature, so navmesh-recast
+# (and thus the forked rerecast) never enters the graph — no [patch.crates-io] here.
+# Only navgen (the `build` feature) needs the fork, and it lives in the root workspace.
 
 [profile.dev]
 opt-level = 1

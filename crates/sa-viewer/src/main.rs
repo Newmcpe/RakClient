@@ -1,22 +1,21 @@
-//! Bevy flythrough of the GTA SA collision geometry parsed by `sa-map`.
+//! Bevy flythrough of a PREBAKED GTA SA world scene.
 //!
-//! Loads collision from an IMG (default: Arizona's `gta3.img`), places every outdoor IPL instance
-//! into one world mesh, and lets you fly around to eyeball that the geometry is real and correctly
-//! placed. Coordinates are converted from SA (Z-up) to Bevy (Y-up): `(x, y, z) → (x, z, -y)`.
+//! The heavy world assembly (parsing every IMG + streamer bin + DFF, ~tens of
+//! seconds) is done ONCE offline by `samap scene`, which dumps a `.scene` file.
+//! This viewer only reads that dump and uploads it — so it opens fast instead of
+//! freezing on launch. Coordinates are SA (Z-up), converted to Bevy (Y-up):
+//! `(x, y, z) → (x, z, -y)`.
 //!
-//! Run:  cargo run --release --manifest-path crates/sa-viewer/Cargo.toml [gta3.img] [maps-dir]
+//! Bake:  cargo run --release -p sa-map --bin samap -- scene <gta3.img> <data> world.scene [objects.csv]
+//! View:  cargo run --release --manifest-path crates/sa-viewer/Cargo.toml -- world.scene [nav.nav]
 //!
-//! Controls: hold RIGHT MOUSE to look · WASD move · Space/Ctrl up/down · Shift boost.
+//! Controls: CLICK to look (Esc release) · WASD move · Space/Ctrl up/down · Shift boost.
 
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use bevy::render::mesh::PrimitiveTopology;
 use bevy::render::render_asset::RenderAssetUsages;
-
-const DEFAULT_IMG: &str =
-    r"C:\Users\Newmcpeishka\AppData\Local\Programs\Arizona Games Launcher\bin\arizona\models\gta3.img";
-const DEFAULT_MAPS: &str =
-    r"C:\Users\Newmcpeishka\AppData\Local\Programs\Arizona Games Launcher\bin\arizona\data";
+use bevy::window::{CursorGrabMode, PrimaryWindow};
 
 /// The parsed world geometry, handed to the setup system to build a Bevy mesh from.
 #[derive(Resource)]
@@ -34,28 +33,30 @@ struct HoleMarkers;
 #[derive(Resource)]
 struct StreamedObjects(sa_map::Mesh);
 
-/// Read an `objects` CSV (`model_id,x,y,z,rx,ry,rz`) into placement tuples for `world::place_objects`.
-fn load_objects_csv(path: &str) -> Vec<(i32, sa_map::Vec3, sa_map::Vec3)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        eprintln!("could not read objects csv {path}");
-        return Vec::new();
+/// Walkable navmesh detail triangles (SA space), rendered as a translucent green
+/// carpet slightly above the ground so coverage reads at a glance.
+#[derive(Resource)]
+struct NavOverlay(Vec<[[f32; 3]; 3]>);
+
+/// Interactive navmesh path tester: `1` sets the start, `2` sets the end (and
+/// plans), `C` clears. Points are picked by raycasting the camera crosshair
+/// against the navmesh detail triangles; the planned route draws as gizmo lines.
+#[derive(Resource, Default)]
+struct PathTest {
+    query: Option<sa_nav::NavQuery>,
+    start: Option<[f32; 3]>,
+    end: Option<[f32; 3]>,
+    waypoints: Vec<[f32; 3]>,
+}
+
+/// Parse an `SA_NAV_TEST` "x1,y1,z1:x2,y2,z2" spec into (start, end) SA points.
+fn parse_test_spec(spec: &str) -> Option<([f32; 3], [f32; 3])> {
+    let (a, b) = spec.split_once(':')?;
+    let pt = |s: &str| -> Option<[f32; 3]> {
+        let v: Vec<f32> = s.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+        (v.len() == 3).then(|| [v[0], v[1], v[2]])
     };
-    let mut out = Vec::new();
-    for line in text.lines().skip(1) {
-        let f: Vec<&str> = line.split(',').collect();
-        if f.len() < 7 {
-            continue;
-        }
-        let p: Vec<f32> = f[1..7].iter().filter_map(|s| s.trim().parse().ok()).collect();
-        if let (Ok(id), 6) = (f[0].trim().parse::<i32>(), p.len()) {
-            out.push((
-                id,
-                sa_map::Vec3::new(p[0], p[1], p[2]),
-                sa_map::Vec3::new(p[3], p[4], p[5]),
-            ));
-        }
-    }
-    out
+    Some((pt(a)?, pt(b)?))
 }
 
 /// The fly camera's accumulated look angles (radians).
@@ -67,63 +68,91 @@ struct FlyCam {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let img = args.next().unwrap_or_else(|| DEFAULT_IMG.to_string());
-    let maps = args.next().unwrap_or_else(|| DEFAULT_MAPS.to_string());
+    let scene_path = match args.next() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "usage: sa-viewer <world.scene> [nav.nav]\n  \
+                 bake first: samap scene <gta3.img> <data-dir> world.scene [objects.csv]"
+            );
+            std::process::exit(2);
+        }
+    };
 
-    println!("loading collision from {img}\nplacing instances from {maps}");
-    let (models, instances) = match sa_map::load::assemble_world(&img, &maps) {
-        Ok(v) => v,
+    println!("loading scene {scene_path}…");
+    let t0 = std::time::Instant::now();
+    let scene = match std::fs::File::open(&scene_path)
+        .map_err(|e| e.to_string())
+        .and_then(|f| {
+            sa_map::scene::Scene::load(&mut std::io::BufReader::new(f)).map_err(|e| e.to_string())
+        }) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("failed to load world: {e}");
+            eprintln!("failed to load scene {scene_path}: {e}");
             std::process::exit(1);
         }
     };
-    let mesh = sa_map::world::build(&models, &instances, Some(0));
+    println!(
+        "scene loaded in {:.1?}: base {} tris, streamed {} tris, {} holes",
+        t0.elapsed(),
+        scene.base.triangle_count(),
+        scene.streamed.triangle_count(),
+        scene.holes.len(),
+    );
+    let mesh = scene.base;
+    let streamed = scene.streamed;
+    let holes = scene.holes;
 
-    // Diagnostic markers: interior-0 instances whose model placed NO collision and is NOT a LOD proxy —
-    // these are the real "holes". A red marker at each shows exactly where geometry is missing.
-    use std::collections::HashSet;
-    // A real hole = an instance whose model's collision is absent from ALL loaded files. A model that
-    // IS present but has zero primitives (bushes, walk-through props) is no-collision *by design*, not
-    // a hole — so we key on "known" (name present in any .col), not "has primitives".
-    let known: HashSet<String> = models.iter().map(|m| m.name.to_ascii_lowercase()).collect();
-    // A model with no collision by design: LOD proxies (name conventions: starts/contains "lod", or
-    // ends in the "_l"/"_ol"/"_ld" LOD suffixes) and "dummy" placeholders. These aren't real holes.
-    let no_collision_by_design = |n: &str| {
-        n.is_empty()
-            || n == "dummy"
-            || n.starts_with("lod")
-            || n.contains("lod")
-            || n.ends_with("_l")
-            || n.ends_with("_ol")
-            || n.ends_with("_ld")
-    };
-    let mut holes: Vec<[f32; 3]> = Vec::new();
-    for i in instances.iter().filter(|i| i.interior == 0) {
-        let nm = i.model_name.to_ascii_lowercase();
-        if known.contains(&nm) || no_collision_by_design(&nm) {
-            continue;
+    // Optional overlay: a `.nav` navmesh from `navgen` — walkable detail triangles in SA space,
+    // plus the pathfinding view for the interactive path tester (keys 1/2/C).
+    let mut path_test = PathTest::default();
+    let nav_tris: Vec<[[f32; 3]; 3]> = if let Some(nav_path) = args.next() {
+        match std::fs::File::open(&nav_path)
+            .map_err(|e| e.to_string())
+            .and_then(|f| {
+                sa_nav::NavMesh::load(&mut std::io::BufReader::new(f)).map_err(|e| e.to_string())
+            }) {
+            Ok(nav) => {
+                println!(
+                    "navmesh overlay: {} polys, {} detail tris",
+                    nav.polys.len(),
+                    nav.detail_tris.len()
+                );
+                let tris = nav
+                    .detail_tris
+                    .iter()
+                    .map(|t| t.map(|i| nav.detail_verts[i as usize]))
+                    .collect();
+                let query = sa_nav::NavQuery::new(nav);
+                // SA_NAV_TEST="x1,y1,z1:x2,y2,z2" plants a path at startup — deterministic
+                // verification without aiming the crosshair by hand.
+                if let Ok(spec) = std::env::var("SA_NAV_TEST") {
+                    if let Some((a, b)) = parse_test_spec(&spec) {
+                        path_test.start = Some(a);
+                        path_test.end = Some(b);
+                        match query.find_path(a, b) {
+                            Some(pts) => {
+                                println!("path(test): {} waypoints", pts.len());
+                                path_test.waypoints = pts;
+                            }
+                            None => println!("path(test): NO ROUTE"),
+                        }
+                    }
+                }
+                path_test.query = Some(query);
+                tris
+            }
+            Err(e) => {
+                eprintln!("could not load navmesh {nav_path}: {e}");
+                Vec::new()
+            }
         }
-        holes.push([i.position.x, i.position.y, i.position.z]);
-    }
-    // Optional overlay: server-streamed CreateObject placements (Arizona's custom map) from a CSV
-    // produced by `objects <pcap>`. Resolved to collision via the IDE map, placed with euler rotation.
-    let streamed = if let Some(csv) = args.next() {
-        let objects = load_objects_csv(&csv);
-        let ide_map = sa_map::load::load_ide_map(&maps);
-        let m = sa_map::world::place_objects(&models, &ide_map, &objects);
-        println!(
-            "streamed-object overlay: {} placements → {} triangles",
-            objects.len(),
-            m.triangle_count()
-        );
-        m
     } else {
-        sa_map::Mesh::default()
+        Vec::new()
     };
 
     println!(
-        "loaded {} triangles ({} vertices), {} unplaced-object markers — opening viewer…\ncontrols: RIGHT MOUSE look · WASD move · Space/Ctrl up/down · Shift boost · H toggle markers · P print pos",
+        "loaded {} triangles ({} vertices), {} unplaced-object markers — opening viewer…\ncontrols: CLICK to look (Esc release) · WASD move · Space/Ctrl up/down · Shift boost · H toggle markers · P print pos · 1/2 path start/end · C clear path",
         mesh.triangle_count(),
         mesh.positions.len(),
         holes.len(),
@@ -145,8 +174,20 @@ fn main() {
         .insert_resource(Geometry(mesh))
         .insert_resource(Holes(holes))
         .insert_resource(StreamedObjects(streamed))
-        .add_systems(Startup, setup)
-        .add_systems(Update, (fly, toggle_markers, report_position))
+        .insert_resource(NavOverlay(nav_tris))
+        .insert_resource(path_test)
+        .add_systems(Startup, (setup, spawn_crosshair))
+        .add_systems(
+            Update,
+            (
+                cursor_grab,
+                fly,
+                toggle_markers,
+                report_position,
+                path_pick,
+                draw_path,
+            ),
+        )
         .run();
 }
 
@@ -157,6 +198,7 @@ fn setup(
     geometry: Res<Geometry>,
     holes: Res<Holes>,
     streamed: Res<StreamedObjects>,
+    nav: Res<NavOverlay>,
 ) {
     // Expand to a non-indexed mesh (each triangle its own 3 vertices) so flat normals compute cleanly,
     // converting SA (x, y, z / Z-up) into Bevy (x, z, -y / Y-up) as we go.
@@ -169,7 +211,10 @@ fn setup(
         colors.push(height_color(p[2])); // p[2] = SA z = ground height
     }
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.compute_flat_normals();
@@ -204,7 +249,10 @@ fn setup(
             let p = src.positions[i as usize];
             positions.push([p[0], p[2], -p[1]]);
         }
-        let mut om = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        let mut om = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
         om.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         om.compute_flat_normals();
         commands.spawn((
@@ -218,6 +266,33 @@ fn setup(
         ));
     }
 
+    // Navmesh overlay: walkable detail triangles as a translucent green carpet, lifted 0.15 m so
+    // it doesn't z-fight the ground it follows.
+    if !nav.0.is_empty() {
+        let mut positions = Vec::with_capacity(nav.0.len() * 3);
+        for tri in &nav.0 {
+            for p in tri {
+                positions.push([p[0], p[2] + 0.15, -p[1]]); // SA → Bevy
+            }
+        }
+        let mut nm = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        nm.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        nm.compute_flat_normals();
+        commands.spawn((
+            Mesh3d(meshes.add(nm)),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgba(0.1, 0.9, 0.25, 0.55),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                cull_mode: None,
+                ..default()
+            })),
+        ));
+    }
+
     // Red markers at every unplaced object (a hole). Each is a small box; toggle with H.
     if !holes.0.is_empty() {
         let mut positions = Vec::new();
@@ -225,7 +300,10 @@ fn setup(
             let center = [h[0], h[2], -h[1]]; // SA → Bevy
             push_marker_box(&mut positions, center, 3.0);
         }
-        let mut marker = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        let mut marker = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
         marker.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         marker.compute_flat_normals();
         commands.spawn((
@@ -250,13 +328,15 @@ fn setup(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.6, 0.0)),
     ));
 
-    // Start at the sawmill (SA -506,-190,78 → Bevy -506,78,190), lifted and angled down.
+    // Start at the sawmill (SA -506,-190,78 → Bevy -506,78,190), high above the giant-fir canopy
+    // (their render meshes reach SA z≈190) and angled down so the spawn view is the clearing, not
+    // the inside of a trunk.
     let yaw = 0.0f32;
-    let pitch = -0.5f32;
+    let pitch = -0.9f32;
     commands.spawn((
         Camera3d::default(),
         Transform {
-            translation: Vec3::new(-506.0, 150.0, 260.0),
+            translation: Vec3::new(-506.0, 300.0, 330.0),
             rotation: Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0),
             ..default()
         },
@@ -353,11 +433,68 @@ fn height_color(z: f32) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], 1.0]
 }
 
+/// Cursor capture, click-to-grab / Escape-to-release (the safe editor/FPS pattern).
+///
+/// Grabbing at STARTUP hangs the whole desktop on Windows: `Locked` warps + hides
+/// the cursor every frame, and if the window isn't focused yet the pointer looks
+/// frozen system-wide. So we start with a FREE cursor and only capture on a LEFT
+/// CLICK inside the window; Escape (or losing focus) releases it.
+fn cursor_grab(
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut window: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let Ok(mut w) = window.get_single_mut() else {
+        return;
+    };
+    let grabbed = w.cursor_options.grab_mode != CursorGrabMode::None;
+    if !grabbed && buttons.just_pressed(MouseButton::Left) {
+        w.cursor_options.grab_mode = CursorGrabMode::Locked;
+        w.cursor_options.visible = false;
+    } else if grabbed && keys.just_pressed(KeyCode::Escape) {
+        w.cursor_options.grab_mode = CursorGrabMode::None;
+        w.cursor_options.visible = true;
+    }
+}
+
+/// A fixed centre-screen aiming reticle: the crosshair the raycast picker (`1`/`2`)
+/// shoots through, so the placed marker always lands exactly where this dot points.
+#[derive(Component)]
+struct Crosshair;
+
+fn spawn_crosshair(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            // Let clicks/pointer pass through — this is a HUD overlay, not a button.
+            PickingBehavior::IGNORE,
+            Crosshair,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Node {
+                    width: Val::Px(6.0),
+                    height: Val::Px(6.0),
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BorderColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
+                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.9)),
+            ));
+        });
+}
+
 fn fly(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    buttons: Res<ButtonInput<MouseButton>>,
     mut motion: EventReader<MouseMotion>,
+    window: Query<&Window, With<PrimaryWindow>>,
     mut q: Query<(&mut Transform, &mut FlyCam)>,
 ) {
     let dt = time.delta().as_secs_f32();
@@ -365,8 +502,12 @@ fn fly(
         return;
     };
 
-    // Mouse look only while the right button is held; otherwise discard motion so the view holds.
-    if buttons.pressed(MouseButton::Right) {
+    // Mouse-look whenever the cursor is grabbed (FPS-style); with it released
+    // (Escape) discard motion so the view holds while the pointer is free.
+    let grabbed = window
+        .get_single()
+        .is_ok_and(|w| w.cursor_options.grab_mode != CursorGrabMode::None);
+    if grabbed {
         let mut delta = Vec2::ZERO;
         for ev in motion.read() {
             delta += ev.delta;
@@ -407,5 +548,158 @@ fn fly(
             1.0
         };
         tf.translation += dir.normalize() * 60.0 * boost * dt;
+    }
+}
+
+/// SA -> Bevy point conversion (matches the mesh build in `setup`).
+fn sa_to_bevy(p: [f32; 3]) -> Vec3 {
+    Vec3::new(p[0], p[2], -p[1])
+}
+
+/// Pick path endpoints with the camera crosshair: `1` = start, `2` = end (plans
+/// immediately when both are set), `C` = clear. The pick ray is intersected with
+/// the navmesh detail triangles in SA space, so a picked point is always on (or a
+/// hair above) the walkable surface `NavQuery::locate` expects.
+fn path_pick(
+    keys: Res<ButtonInput<KeyCode>>,
+    q: Query<&Transform, With<FlyCam>>,
+    nav: Res<NavOverlay>,
+    mut test: ResMut<PathTest>,
+) {
+    let set_start = keys.just_pressed(KeyCode::Digit1);
+    let set_end = keys.just_pressed(KeyCode::Digit2);
+    if keys.just_pressed(KeyCode::KeyC) {
+        test.start = None;
+        test.end = None;
+        test.waypoints.clear();
+        println!("path: cleared");
+        return;
+    }
+    if !set_start && !set_end {
+        return;
+    }
+    if test.query.is_none() {
+        println!("path: no navmesh loaded (pass a .nav as the 4th argument)");
+        return;
+    }
+    let Ok(cam) = q.get_single() else {
+        return;
+    };
+    // Camera ray in SA space: Bevy (x, y, z) -> SA (x, -z, y) for both origin and direction.
+    let o = cam.translation;
+    let d = cam.rotation * Vec3::NEG_Z;
+    let origin = [o.x, -o.z, o.y];
+    let dir = [d.x, -d.z, d.y];
+    let Some(hit) = raycast_tris(origin, dir, &nav.0) else {
+        println!("path: crosshair is not over the navmesh");
+        return;
+    };
+    if set_start {
+        test.start = Some(hit);
+        println!("path: start {:.1},{:.1},{:.1}", hit[0], hit[1], hit[2]);
+    } else {
+        test.end = Some(hit);
+        println!("path: end {:.1},{:.1},{:.1}", hit[0], hit[1], hit[2]);
+    }
+    test.waypoints.clear();
+    if let (Some(start), Some(end), Some(query)) = (test.start, test.end, test.query.as_ref()) {
+        match query.find_path(start, end) {
+            Some(points) => {
+                let mut length = 0.0;
+                let mut prev = start;
+                for w in &points {
+                    length += ((w[0] - prev[0]).powi(2)
+                        + (w[1] - prev[1]).powi(2)
+                        + (w[2] - prev[2]).powi(2))
+                    .sqrt();
+                    prev = *w;
+                }
+                println!("path: {} waypoints, {:.1} m", points.len(), length);
+                test.waypoints = points;
+            }
+            None => println!("path: NO ROUTE between the picked points"),
+        }
+    }
+}
+
+/// Nearest intersection of a ray with a triangle soup (Möller–Trumbore), SA space.
+fn raycast_tris(origin: [f32; 3], dir: [f32; 3], tris: &[[[f32; 3]; 3]]) -> Option<[f32; 3]> {
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let mut best: Option<f32> = None;
+    for t in tris {
+        let e1 = sub(t[1], t[0]);
+        let e2 = sub(t[2], t[0]);
+        let h = cross(dir, e2);
+        let a = dot(e1, h);
+        if a.abs() < 1e-7 {
+            continue;
+        }
+        let f = 1.0 / a;
+        let sv = sub(origin, t[0]);
+        let u = f * dot(sv, h);
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let qv = cross(sv, e1);
+        let v = f * dot(dir, qv);
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let tt = f * dot(e2, qv);
+        if tt > 0.01 && best.is_none_or(|b| tt < b) {
+            best = Some(tt);
+        }
+    }
+    best.map(|tt| {
+        [
+            origin[0] + dir[0] * tt,
+            origin[1] + dir[1] * tt,
+            origin[2] + dir[2] * tt,
+        ]
+    })
+}
+
+/// Draw the picked endpoints and the planned route as immediate-mode gizmos,
+/// lifted ~0.4 m so the line reads above the green navmesh carpet.
+fn draw_path(test: Res<PathTest>, mut gizmos: Gizmos) {
+    let lift = Vec3::Y * 0.4;
+    if let Some(s) = test.start {
+        gizmos.sphere(
+            Isometry3d::from_translation(sa_to_bevy(s) + lift),
+            0.5,
+            Color::srgb(0.2, 0.4, 1.0),
+        );
+    }
+    if let Some(e) = test.end {
+        gizmos.sphere(
+            Isometry3d::from_translation(sa_to_bevy(e) + lift),
+            0.5,
+            Color::srgb(1.0, 0.2, 0.2),
+        );
+    }
+    if test.waypoints.is_empty() {
+        return;
+    }
+    let mut prev = match test.start {
+        Some(s) => sa_to_bevy(s) + lift,
+        None => return,
+    };
+    for w in &test.waypoints {
+        let next = sa_to_bevy(*w) + lift;
+        gizmos.line(prev, next, Color::srgb(1.0, 0.95, 0.1));
+        gizmos.sphere(
+            Isometry3d::from_translation(next),
+            0.18,
+            Color::srgb(1.0, 0.7, 0.1),
+        );
+        prev = next;
     }
 }
