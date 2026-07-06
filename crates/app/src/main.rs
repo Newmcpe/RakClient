@@ -74,6 +74,11 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "@auto")]
     pcap: Option<PathBuf>,
 
+    /// A `.nav` navmesh (built by `sa-nav`'s `navgen`) enabling the native `walkTo` walker
+    /// (Lua: `walkTo(x, y, z)` / `walkStop()` / `isWalking()`).
+    #[arg(long)]
+    navmesh: Option<PathBuf>,
+
     /// Self-spawn after N seconds if the server never drives the spawn. `0` (default) = never
     /// self-spawn: stay spectating. On Arizona an unauthorised self-spawn is kicked as suspected
     /// cheating, so leave this off; a spectating bot still receives chat. Enable only for non-Arizona
@@ -122,6 +127,7 @@ impl Cli {
                 .then(|| Duration::from_secs(self.self_spawn_timeout)),
             proxy,
             pcap,
+            navmesh: self.navmesh,
         })
     }
 
@@ -314,6 +320,8 @@ fn log_event(event: &ClientEvent) {
             info!(color = format_args!("{color:08X}"), "server: {text}")
         }
         ClientEvent::Chat { player_id, text } => info!(?player_id, "chat: {text}"),
+        ClientEvent::WalkArrived { x, y, z } => info!(x, y, z, "walkTo: arrived"),
+        ClientEvent::WalkFailed { x, y, z } => warn!(x, y, z, "walkTo: no path"),
         ClientEvent::Disconnected(reason) => warn!(reason = %reason, "disconnected"),
     }
 }

@@ -346,6 +346,12 @@ impl Encode for SpectatorSync {
 /// Outgoing on-foot sync body (`ID_PLAYER_SYNC` = 207).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct OnFootSync {
+    /// Left/right analog steering (`lrAnalog@0`): the real client sends ±128 while strafing, 0
+    /// otherwise. Default 0 keeps the wire output identical to the old fixed-zero encoding.
+    pub left_right: i16,
+    /// Up/down analog steering (`udAnalog@2`): the real client sends **−128 while moving forward**,
+    /// +128 while backing up, 0 when still. Faithful locomotion sets this alongside `keys`/`move_speed`.
+    pub up_down: i16,
     pub keys: u16,
     pub position: Vector3,
     pub quaternion: Quaternion,
@@ -379,9 +385,10 @@ impl Encode for OnFootSync {
     /// The id byte is prepended by the caller/transport.
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
-        // Left/right + up/down analog steering: the original sender zeroes these.
-        w.write_u16(0);
-        w.write_u16(0);
+        // Left/right + up/down analog steering. Zero when idle; the walker sets up_down = -128 while
+        // moving forward, matching the real client (verified against a live 207 capture).
+        w.write_u16(self.left_right as u16);
+        w.write_u16(self.up_down as u16);
         w.write_u16(self.keys);
         w.write_f32(self.position.x);
         w.write_f32(self.position.y);

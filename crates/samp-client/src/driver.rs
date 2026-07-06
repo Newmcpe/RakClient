@@ -85,6 +85,78 @@ enum Step {
     Update,
 }
 
+/// A locomotion gait, reverse-engineered from a live GTA-SA/Arizona on-foot (207)
+/// capture of CJ walking / jogging / sprinting (median over 397 outbound syncs).
+/// The receiving clients animate a remote player from `up_down` + `keys` +
+/// `move_speed`, so matching all three reproduces the real walk/run/sprint look
+/// and speed — unlike the old fly.luau coordmaster (a fixed ~35 u/s fast-travel,
+/// ~3.7× real sprint, one static anim).
+#[derive(Clone, Copy)]
+struct Gait {
+    /// World speed in units/second (position advance rate).
+    speed: f32,
+    /// Reported `move_speed` vector magnitude (≈ `speed / 49` in the capture).
+    move_speed_mag: f32,
+    /// On-foot key bits: 0 = jog (default forward run), `KEY_SPRINT` = sprint,
+    /// `KEY_WALK` = walk.
+    keys: u16,
+    /// Representative animation (index, flags) the real client sends for this gait.
+    anim: (u16, u16),
+}
+
+/// SA-MP key bit for holding the sprint control (default run → sprint).
+const KEY_SPRINT: u16 = 0x0008;
+/// SA-MP key bit for the walk modifier (default run → slow walk).
+const KEY_WALK: u16 = 0x0400;
+/// Up/down analog value the real client sends while moving forward.
+const ANALOG_FORWARD: i16 = -128;
+
+/// Slow walk (KEY_WALK held): ~3.7 u/s, `move_speed` ~0.066.
+const GAIT_WALK: Gait = Gait {
+    speed: 3.7,
+    move_speed_mag: 0.066,
+    keys: KEY_WALK,
+    anim: (1189, 0x8004),
+};
+/// Default jog (push forward, no modifier): ~5.4 u/s, `move_speed` ~0.109.
+const GAIT_JOG: Gait = Gait {
+    speed: 5.4,
+    move_speed_mag: 0.109,
+    keys: 0,
+    anim: (1231, 0x8004),
+};
+/// Sprint (KEY_SPRINT held): ~9.4 u/s, `move_speed` ~0.193.
+const GAIT_SPRINT: Gait = Gait {
+    speed: 9.4,
+    move_speed_mag: 0.193,
+    keys: KEY_SPRINT,
+    anim: (1196, 0x8064),
+};
+
+/// Resolve a `walkTo` mode byte (0 = walk, 1 = jog, 2 = sprint) to its [`Gait`].
+fn gait_for_mode(mode: u8) -> Gait {
+    match mode {
+        0 => GAIT_WALK,
+        2 => GAIT_SPRINT,
+        _ => GAIT_JOG,
+    }
+}
+
+/// Native navmesh walk in progress. Advances the position at the gait's real world
+/// speed (time-based, so any sync cadence is smooth), reporting the matching
+/// analog/keys/move_speed/anim so it reads as a genuine walk/jog/sprint.
+struct WalkState {
+    waypoints: Vec<samp_proto::Vector3>,
+    next: usize,
+    gait: Gait,
+    last_step: Option<Instant>,
+    /// Where the walk ends — reported in `ClientEvent::WalkArrived`.
+    target: samp_proto::Vector3,
+}
+
+/// Stop when within this many units of the final target.
+const WALK_ARRIVE: f32 = 2.0;
+
 pub(crate) struct Driver<T: Transport> {
     config: ClientConfig,
     transport: T,
@@ -98,6 +170,10 @@ pub(crate) struct Driver<T: Transport> {
     last_sync_at: Option<Instant>,
     /// When the periodic `PACKET_STATS_UPDATE` (205) was last sent; drives the 1 Hz stats cadence.
     last_stats_at: Option<Instant>,
+    /// Navmesh pathfinding view, loaded from `ClientConfig::navmesh` — enables the native walker.
+    nav: Option<sa_nav::NavQuery>,
+    /// The active native walk, advanced on the sync tick at its own cadence.
+    walk: Option<WalkState>,
     sync_timer: Option<Interval>,
     reconnect_timer: Option<Pin<Box<Sleep>>>,
     closed: bool,
@@ -156,6 +232,22 @@ impl<T: Transport> Driver<T> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x1234_5678);
+        let nav = config.navmesh.as_ref().and_then(|path| {
+            match std::fs::File::open(path)
+                .map_err(|e| e.to_string())
+                .and_then(|f| {
+                    sa_nav::NavMesh::load(&mut std::io::BufReader::new(f)).map_err(|e| e.to_string())
+                }) {
+                Ok(mesh) => {
+                    tracing::info!(path = %path.display(), polys = mesh.polys.len(), "navmesh loaded");
+                    Some(sa_nav::NavQuery::new(mesh))
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "navmesh load failed — walkTo disabled");
+                    None
+                }
+            }
+        });
         let aim = AimSync::new(seed);
         let emulation = ClientEmulation::new(seed ^ 0x5555_5555_5555_5555, Instant::now());
         Self {
@@ -168,6 +260,8 @@ impl<T: Transport> Driver<T> {
             last_sync: OnFootSync::default(),
             last_sync_at: None,
             last_stats_at: None,
+            nav,
+            walk: None,
             sync_timer: None,
             reconnect_timer: None,
             closed: false,
@@ -347,19 +441,183 @@ impl<T: Transport> Driver<T> {
         }
     }
 
+    /// Plan a navmesh path from the current position and start the native walker
+    /// with the given gait (0 = walk, 1 = jog, 2 = sprint). Emits `WalkFailed`
+    /// when there is no navmesh or no corridor to the target.
+    fn start_walk(&mut self, target: samp_proto::Vector3, mode: u8) {
+        let from = [
+            self.sync.position.x,
+            self.sync.position.y,
+            self.sync.position.z,
+        ];
+        let to = [target.x, target.y, target.z];
+        let path = self.nav.as_ref().and_then(|nav| nav.find_path(from, to));
+        match path {
+            Some(points) if matches!(self.state, ConnectionState::Spawned) => {
+                let gait = gait_for_mode(mode);
+                tracing::info!(
+                    ?to,
+                    waypoints = points.len(),
+                    speed = gait.speed,
+                    "walkTo: path found, walking"
+                );
+                self.walk = Some(WalkState {
+                    waypoints: points
+                        .into_iter()
+                        .map(|p| samp_proto::Vector3 {
+                            x: p[0],
+                            y: p[1],
+                            z: p[2],
+                        })
+                        .collect(),
+                    next: 0,
+                    gait,
+                    last_step: None,
+                    target,
+                });
+                self.set_walking_flag(true);
+            }
+            _ => {
+                tracing::warn!(?to, nav = self.nav.is_some(), "walkTo failed: no path");
+                self.pending.push_back(ClientEvent::WalkFailed {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                });
+                self.set_walking_flag(false);
+            }
+        }
+    }
+
+    /// Abort the active walk: clear the reported forward-input/velocity/animation
+    /// so the next sync shows the bot standing idle.
+    fn stop_walk(&mut self) {
+        if self.walk.take().is_some() {
+            self.set_standing();
+            self.set_walking_flag(false);
+            self.mirror_to_state();
+        }
+    }
+
+    /// Report the idle standing state on the outbound sync (no forward analog, no
+    /// movement keys, zero velocity, no animation).
+    fn set_standing(&mut self) {
+        self.sync.up_down = 0;
+        self.sync.left_right = 0;
+        self.sync.keys = 0;
+        self.sync.move_speed = samp_proto::Vector3::default();
+        self.sync.animation_id = 0;
+        self.sync.animation_flags = 0;
+    }
+
+    /// Mirror the walker liveness into the shared state for `isWalking()`.
+    fn set_walking_flag(&mut self, walking: bool) {
+        if let Some(state) = &self.bot_state {
+            state.borrow_mut().walking = walking;
+        }
+    }
+
+    /// Advance the active walk by real elapsed time at the gait's world speed, and
+    /// report the matching forward-analog + keys + move_speed + animation so it
+    /// reads as a genuine walk/jog/sprint. Runs inside the spawned sync send path,
+    /// after `mirror_from_state` so the walker overrides script writes.
+    fn step_walk(&mut self) {
+        let Some(mut walk) = self.walk.take() else {
+            return;
+        };
+        let now = Instant::now();
+        // Time-based advance: distance = speed * dt. First tick primes the clock
+        // (no jump); afterwards the position moves at the true gait speed regardless
+        // of the sync cadence. dt is clamped so a stall can't teleport the bot.
+        let dt = match walk.last_step {
+            Some(at) => now.duration_since(at).as_secs_f32().min(0.5),
+            None => 0.0,
+        };
+        walk.last_step = Some(now);
+        let advance = walk.gait.speed * dt;
+
+        let pos = self.sync.position;
+        // Retarget: skip waypoints already within this step's reach.
+        let (mut dx, mut dy, mut dz, mut d);
+        loop {
+            let Some(wp) = walk.waypoints.get(walk.next) else {
+                // Path exhausted: arrived.
+                self.sync.position = walk.target;
+                self.set_standing();
+                self.set_walking_flag(false);
+                self.mirror_to_state();
+                self.pending.push_back(ClientEvent::WalkArrived {
+                    x: walk.target.x,
+                    y: walk.target.y,
+                    z: walk.target.z,
+                });
+                tracing::info!(
+                    x = walk.target.x,
+                    y = walk.target.y,
+                    z = walk.target.z,
+                    "walkTo: arrived"
+                );
+                return;
+            };
+            (dx, dy, dz) = (wp.x - pos.x, wp.y - pos.y, wp.z - pos.z);
+            d = (dx * dx + dy * dy + dz * dz).sqrt();
+            let last = walk.next + 1 == walk.waypoints.len();
+            let reach = if last { WALK_ARRIVE } else { advance.max(0.5) };
+            if d > reach {
+                break;
+            }
+            walk.next += 1;
+        }
+
+        let inv = 1.0 / d;
+        let (ux, uy, uz) = (dx * inv, dy * inv, dz * inv);
+        // Never overshoot the current waypoint in one step.
+        let step = advance.min(d);
+        let jitter = |scale: f32| (rand::random::<f32>() * 2.0 - 1.0) * scale;
+        self.sync.position = samp_proto::Vector3 {
+            x: pos.x + ux * step,
+            y: pos.y + uy * step,
+            z: pos.z + uz * step + jitter(0.02),
+        };
+        // Report the gait: forward analog + movement keys + a velocity of the
+        // gait's magnitude in the travel direction + the gait animation.
+        let mag = walk.gait.move_speed_mag;
+        self.sync.up_down = ANALOG_FORWARD;
+        self.sync.left_right = 0;
+        self.sync.keys = walk.gait.keys;
+        self.sync.move_speed = samp_proto::Vector3 {
+            x: ux * mag,
+            y: uy * mag,
+            z: uz * mag,
+        };
+        self.sync.animation_id = walk.gait.anim.0;
+        self.sync.animation_flags = walk.gait.anim.1;
+        self.mirror_to_state();
+        self.walk = Some(walk);
+    }
+
     /// Act on `updateSync()` / `reconnect(ms)` flags scripts set on the bot state.
     async fn poll_bot_actions(&mut self) {
-        let (force_sync, reconnect_in, spawn_requested) = match &self.bot_state {
+        let (force_sync, reconnect_in, spawn_requested, walk_to, walk_stop) = match &self.bot_state
+        {
             Some(state) => {
                 let mut s = state.borrow_mut();
                 (
                     std::mem::take(&mut s.force_sync),
                     s.reconnect_in_ms.take(),
                     std::mem::take(&mut s.spawn_requested),
+                    s.walk_to.take(),
+                    std::mem::take(&mut s.walk_stop),
                 )
             }
             None => return,
         };
+        if walk_stop {
+            self.stop_walk();
+        }
+        if let Some((target, mode)) = walk_to {
+            self.start_walk(target, mode);
+        }
         // `sampSpawnPlayer()` — explicit spawn request (RakSAMP Lite's "reqspawn"). Usually NOT needed
         // (the server drives the spawn via RequestSpawnResponse(allow==2) after login); this is the
         // manual override. Sets `spawn_requested` so a non-2 allow still spawns us.
@@ -920,6 +1178,7 @@ impl<T: Transport> Driver<T> {
     /// inventory, then aim. Bails on the first transport error (the caller disconnects).
     async fn run_spawned_sync(&mut self, force: bool) -> raknet::Result<()> {
         self.mirror_from_state();
+        self.step_walk();
         self.adjust_on_foot_from_emulation();
         self.send_on_foot_sync(force).await?;
         self.send_arizona_221_sync().await?;
@@ -1094,6 +1353,8 @@ impl<T: Transport> Driver<T> {
     }
 
     fn on_disconnect(&mut self, reason: DisconnectReason) {
+        // A dropped connection ends any active walk; the next spawn starts clean.
+        self.stop_walk();
         self.aim.reset();
         if let Some(state) = self.bot_state.as_ref() {
             self.emulation.reset(&mut state.borrow_mut());

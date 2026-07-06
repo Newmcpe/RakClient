@@ -143,6 +143,13 @@ pub struct LocalPlayer {
     /// Set by `sampSpawnPlayer()`; in the Arizona flow the driver sends `RPC_Spawn` and clears it. The
     /// script calls this after the login (or registration) dialog flow completes.
     pub spawn_requested: bool,
+    /// Set by `walkTo(x, y, z, mode)`; the driver plans a navmesh path and starts the native walker.
+    /// `mode`: 0 = walk, 1 = jog (default), 2 = sprint.
+    pub walk_to: Option<(Vector3, u8)>,
+    /// Set by `walkStop()`; the driver aborts the active walk and clears it.
+    pub walk_stop: bool,
+    /// Mirrored by the driver: whether the native walker is currently moving (`isWalking()`).
+    pub walking: bool,
 }
 
 /// [`LocalPlayer`] shared between the (non-`Send`) driver and script engine on the client thread.
@@ -164,6 +171,9 @@ impl LocalPlayer {
             force_sync: false,
             reconnect_in_ms: None,
             spawn_requested: false,
+            walk_to: None,
+            walk_stop: false,
+            walking: false,
         }
     }
 

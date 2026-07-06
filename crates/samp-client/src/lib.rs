@@ -67,6 +67,8 @@ pub struct ClientConfig {
     pub proxy: Option<raknet::ProxyConfig>,
     /// When set, capture every RakNet datagram (both directions) to this libpcap file for debugging.
     pub pcap: Option<std::path::PathBuf>,
+    /// Optional `.nav` navmesh (from `navgen`) enabling the native `walkTo` walker.
+    pub navmesh: Option<std::path::PathBuf>,
 }
 
 impl ClientConfig {
@@ -84,6 +86,7 @@ impl ClientConfig {
                 self_spawn_timeout: None,
                 proxy: None,
                 pcap: None,
+                navmesh: None,
             },
         }
     }
@@ -164,6 +167,18 @@ pub enum ClientEvent {
     Chat {
         player_id: PlayerId,
         text: String,
+    },
+    /// The native navmesh walker reached its target.
+    WalkArrived {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    /// `walkTo` could not start: no navmesh loaded, or no path connects the bot to the target.
+    WalkFailed {
+        x: f32,
+        y: f32,
+        z: f32,
     },
     Disconnected(String),
 }

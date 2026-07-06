@@ -189,6 +189,8 @@ fn stats_update_layout() {
 #[test]
 fn on_foot_sync_layout() {
     let sync = OnFootSync {
+        left_right: 0,
+        up_down: -128,
         keys: 0xBEEF,
         position: Vector3 {
             x: 1.0,
@@ -218,7 +220,7 @@ fn on_foot_sync_layout() {
 
     let mut r = BitStreamReader::new(&body);
     assert_eq!(r.read_u16().unwrap(), 0); // lrAnalog
-    assert_eq!(r.read_u16().unwrap(), 0); // udAnalog
+    assert_eq!(r.read_u16().unwrap() as i16, -128); // udAnalog (moving forward)
     assert_eq!(r.read_u16().unwrap(), 0xBEEF); // keys
     assert_eq!(r.read_f32().unwrap(), 1.0);
     assert_eq!(r.read_f32().unwrap(), 2.0);

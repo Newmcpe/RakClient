@@ -5,6 +5,8 @@ edition = "2021"
 description = "SA-MP connection state machine and high-level async client."
 
 [dependencies]
+sa-nav.workspace = true
+rand.workspace = true
 samp-proto = { workspace = true }
 raknet = { workspace = true }
 tokio = { workspace = true }

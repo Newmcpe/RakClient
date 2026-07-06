@@ -164,6 +164,36 @@ pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()>
             Ok(())
         })?,
     )?;
+    let s = state.clone();
+    globals.set(
+        "walkTo",
+        // Native navmesh walk (driver-side): plans a path over the loaded .nav and moves with a real
+        // GTA-SA gait — walk/jog/sprint speeds + forward analog + movement keys + animation, reversed
+        // from a live on-foot (207) capture. Optional `mode`: "walk" | "jog" (default) | "sprint".
+        // Fire-and-forget; poll `isWalking()` or handle the WalkArrived/WalkFailed client events.
+        lua.create_function(move |_, (x, y, z, mode): (f32, f32, f32, Option<String>)| {
+            let mode = match mode.as_deref() {
+                Some("walk") => 0u8,
+                Some("sprint") => 2u8,
+                _ => 1u8, // jog: the default forward run
+            };
+            s.borrow_mut().walk_to = Some((Vector3 { x, y, z }, mode));
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    globals.set(
+        "walkStop",
+        lua.create_function(move |_, ()| {
+            s.borrow_mut().walk_stop = true;
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    globals.set(
+        "isWalking",
+        lua.create_function(move |_, ()| Ok(s.borrow().walking))?,
+    )?;
     let s = state;
     globals.set(
         "reconnect",

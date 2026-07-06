@@ -82,6 +82,12 @@ declare function getBotKeys(): number
 declare function setBotKeys(keys: number): ()
 declare function updateSync(): ()
 declare function sampSpawnPlayer(): ()
+-- Native navmesh walker (driver-side; needs --navmesh <file.nav>). Fire-and-forget:
+-- poll isWalking() for completion. walkStop() aborts the active walk. `mode` picks the GTA-SA gait:
+-- "walk" (~3.7 u/s), "jog" (default, ~5.4 u/s), or "sprint" (~9.4 u/s).
+declare function walkTo(x: number, y: number, z: number, mode: string?): ()
+declare function walkStop(): ()
+declare function isWalking(): boolean
 declare function reconnect(ms: number): ()
 
 -- Outgoing wire (`src/lib.rs`).

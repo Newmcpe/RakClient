@@ -156,6 +156,7 @@ async fn reaches_spawned_emitting_events_in_order() {
             }
             ClientEvent::Disconnected(reason) => panic!("unexpected disconnect: {reason}"),
             ClientEvent::ServerMessage { .. } | ClientEvent::Chat { .. } => {}
+            ClientEvent::WalkArrived { .. } | ClientEvent::WalkFailed { .. } => {}
             ClientEvent::StateChanged(_) => {}
         }
     }
