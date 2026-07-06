@@ -1,0 +1,20 @@
+[package]
+name = "navmesh-recast"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "navmesh_recast"
+path = "src/lib.rs"
+
+[dependencies]
+# Spike: pure-Rust Recast port, evaluated as a drop-in alternative to the C++
+# wrapper. Same output struct (PolyNavmesh) so downstream is untouched. Selected
+# at runtime via FUFLO_BACKEND=rerecast. glam pinned to rerecast's version so the
+# vector types line up.
+#
+rerecast = "0.3"
+glam = "0.30"
+
+[build-dependencies]
+cc = "1"

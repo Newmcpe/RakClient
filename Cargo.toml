@@ -8,6 +8,8 @@ members = [
     "crates/app",
     "crates/test-support",
     "crates/sa-map",
+    "crates/sa-nav",
+    "crates/navmesh-recast",
 ]
 
 # Shared dependency versions. Member crates opt in with `dep.workspace = true`.
@@ -33,6 +35,14 @@ samp-client = { path = "crates/samp-client" }
 samp-script = { path = "crates/samp-script" }
 test-support = { path = "crates/test-support" }
 sa-map = { path = "crates/sa-map" }
+sa-nav = { path = "crates/sa-nav" }
+navmesh-recast = { path = "crates/navmesh-recast" }
 
 [profile.release]
 lto = "thin"
+
+# The navmesh-recast fork calls a patched rerecast (extra deck_climb params) — the
+# same vendored fork its home workspace patches in. Machine-local path, like the
+# navmesh-recast dep itself.
+[patch.crates-io]
+rerecast = { path = "C:/Users/Newmcpeishka/Desktop/Projects/rerecast" }

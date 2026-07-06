@@ -1,0 +1,20 @@
+[package]
+name = "sa-nav"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Navmesh GENERATION (the `navgen` bin). Off by default so runtime consumers
+# (samp-client's walker) never pull the machine-local navmesh-recast fork —
+# they only need the pure `.nav` loader + pathfinding below.
+build = ["dep:navmesh-recast", "dep:sa-map"]
+
+[dependencies]
+sa-map = { workspace = true, optional = true }
+# Our navmesh build pipeline (in-workspace) over the forked rerecast
+# (see [patch.crates-io] in the workspace root — machine-local until published).
+navmesh-recast = { workspace = true, optional = true }
+
+[[bin]]
+name = "navgen"
+required-features = ["build"]
