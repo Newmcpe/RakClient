@@ -101,11 +101,14 @@ impl Reliability {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SplitInfo {
-    id: u16,
-    index: u32,
-    count: u32,
+/// The split-packet header carried by a fragment of a large message: which split this fragment
+/// belongs to (`id`), its position (`index`) and the total fragment count. Public so offline
+/// tooling (`--pcap` dissector consumers) can reassemble fragments like the live layer does.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitInfo {
+    pub id: u16,
+    pub index: u32,
+    pub count: u32,
 }
 
 /// A packet queued for (or awaiting re-) transmission. The 16-bit `messageNumber` is assigned only
@@ -207,7 +210,7 @@ fn decode_packet(r: &mut BitStreamReader<'_>) -> Result<DecodedPacket> {
 pub struct DissectedMessage {
     pub message_number: u32,
     pub reliability: Reliability,
-    pub split: bool,
+    pub split: Option<SplitInfo>,
     pub payload: Vec<u8>,
 }
 
@@ -241,7 +244,7 @@ pub fn dissect_datagram(datagram: &[u8]) -> (Vec<(u32, u32)>, Vec<DissectedMessa
             Ok(p) => msgs.push(DissectedMessage {
                 message_number: p.message_number,
                 reliability: p.reliability,
-                split: p.split.is_some(),
+                split: p.split,
                 payload: p.payload,
             }),
             Err(_) => break,

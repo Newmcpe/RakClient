@@ -25,7 +25,7 @@ mod tables;
 mod transport;
 pub mod wire;
 
-pub use reliability::{dissect_datagram, DissectedMessage};
+pub use reliability::{dissect_datagram, DissectedMessage, SplitInfo};
 pub use socks5::ProxyConfig;
 
 pub type Result<T> = std::result::Result<T, RaknetError>;

@@ -112,7 +112,10 @@ fn dissect_record(n: u64, t: f64, pkt: &[u8]) {
     println!();
     for m in &msgs {
         let id = m.payload.first().copied().unwrap_or(0);
-        let split = if m.split { " SPLIT" } else { "" };
+        let split = match m.split {
+            Some(s) => format!(" SPLIT {}/{} id={}", s.index + 1, s.count, s.id),
+            None => String::new(),
+        };
         // For an RPC the leading id is the RakNet RPC marker and byte 1 is the SA-MP RPC id.
         let extra = if id == RPC_MARKER {
             m.payload

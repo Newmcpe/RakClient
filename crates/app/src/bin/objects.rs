@@ -10,7 +10,7 @@
 //!
 //! Usage: `cargo run -p app --bin objects -- <capture.pcap> [out.csv]`
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::net::Ipv4Addr;
 
@@ -45,6 +45,8 @@ fn main() {
 
     // Keyed by objectId so a re-created object keeps only its latest placement.
     let mut objects: HashMap<u16, (i32, [f32; 3], [f32; 3])> = HashMap::new();
+    // In-flight split reassembly: split id → fragment index → fragment bytes.
+    let mut splits: HashMap<u16, BTreeMap<u32, Vec<u8>>> = HashMap::new();
     let mut off = 24;
     while off + 16 <= bytes.len() {
         let incl = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize;
@@ -71,7 +73,24 @@ fn main() {
 
         let (_acks, msgs) = raknet::dissect_datagram(payload);
         for m in &msgs {
-            let Some((rpc_id, body)) = raknet::wire::parse_rpc(&m.payload) else {
+            // Large RPCs arrive as split fragments (a building's CreateObject carries per-material
+            // texture data and easily exceeds one datagram). Buffer by split id and parse only the
+            // reassembled whole.
+            let whole: Vec<u8>;
+            let msg_payload: &[u8] = match m.split {
+                None => &m.payload,
+                Some(s) => {
+                    let buf = splits.entry(s.id).or_default();
+                    buf.insert(s.index, m.payload.clone());
+                    if buf.len() as u32 != s.count {
+                        continue; // still missing fragments
+                    }
+                    let buf = splits.remove(&s.id).unwrap();
+                    whole = buf.into_values().flatten().collect();
+                    &whole
+                }
+            };
+            let Some((rpc_id, body)) = raknet::wire::parse_rpc(msg_payload) else {
                 continue;
             };
             if rpc_id != RPC_CREATE_OBJECT || body.len() < 30 {
