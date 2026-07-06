@@ -11,6 +11,11 @@
 /scripts/
 # auto-loaded SOCKS5 proxy spec (holds proxy credentials)
 /proxy.txt
+# generated navmesh / baked-scene / capture-extract artifacts (regenerate from the tools)
+*.nav
+*.scene
+/objects.csv
+/out207.txt
 **/*.rs.bk
 Cargo.lock.bak
 *.pdb

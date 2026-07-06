@@ -14,10 +14,12 @@
 //! on these; it lives in later modules so the readers can be validated on their own first.
 
 pub mod col;
+pub mod dff;
 pub mod ide;
 pub mod img;
 pub mod ipl;
 pub mod load;
+pub mod scene;
 pub mod world;
 
 pub use col::{ColBox, ColModel, ColSphere, ColTriangle};
