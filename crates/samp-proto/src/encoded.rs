@@ -1,21 +1,6 @@
-//! SA-MP "encoded string" Huffman codec (`readEncoded`/`writeEncoded`).
-//!
-//! Used for the body text of `ShowDialog` and `Create3DTextLabel`. This is a port of RakNet's
-//! `StringCompressor` + `HuffmanEncodingTree` as shipped in SA-MP:
-//! - the wire layout is `WriteCompressed(u16 bitLength)` followed by the Huffman-coded bits
-//!   (matching `StringCompressor::EncodeString`); decode reads the compressed length then walks the
-//!   tree for exactly that many bits (`StringCompressor::DecodeString` / `DecodeArray`).
-//! - the tree is built from the fixed 256-entry [`FREQUENCY_TABLE`] using RakNet's
-//!   `GenerateFromFrequencyTable` algorithm (zero weights are bumped to 1; the two lowest-weight
-//!   nodes are repeatedly merged; ties insert the newer node *before* equal-weight nodes).
-//!
-//! Verification status: [`FREQUENCY_TABLE`] is byte-identical to RakNet's canonical
-//! `englishCharacterFrequencies` (`Source/StringCompressor.cpp`) and the tree construction mirrors
-//! `Source/DS_HuffmanEncodingTree.cpp` exactly — insert-before-equal ties, `lesser`=left/`greater`=right
-//! on merge, left=0/right=1 root-to-leaf codes. This matters: the `\r` (idx 13) weight is **2**, not
-//! the 0→1 bump, and `\n` (idx 10) is **722**, not 723 — getting either wrong permutes the whole
-//! weight-1 leaf cluster (all 0x80-0xFF) and yields correlated mojibake (a uniform +2 byte shift on
-//! Cyrillic) even though `encode`→`decode` still round-trips self-consistently.
+//! SA-MP "encoded string" Huffman codec (`readEncoded`/`writeEncoded`), used for `ShowDialog` /
+//! `Create3DTextLabel` body text; a port of RakNet's `StringCompressor` + `HuffmanEncodingTree`.
+//! Wire layout, tree construction, and verification notes: see docs/memory/samp-proto/encoded.md#module
 
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
 
@@ -59,9 +44,7 @@ struct HuffmanTree {
 
 impl HuffmanTree {
     fn build() -> Self {
-        // Mirror RakNet's sorted-list construction: zero weights become 1, then repeatedly merge the
-        // two lowest-weight nodes. Insertion keeps ascending weight; equal weights insert before
-        // existing equal-weight nodes (RakNet `InsertNodeIntoSortedList`).
+        // RakNet sorted-list construction: zero weights → 1, repeatedly merge the two lowest; equal weights insert before existing (`InsertNodeIntoSortedList`).
         let mut list: Vec<WeightedNode> = Vec::with_capacity(256);
         for (byte, &freq) in FREQUENCY_TABLE.iter().enumerate() {
             let weight = if freq == 0 { 1 } else { freq as u64 };
@@ -85,8 +68,7 @@ impl HuffmanTree {
             };
             insert_sorted(&mut list, merged);
         }
-        // `FREQUENCY_TABLE` has 256 entries, so the reduction always leaves exactly one node; the
-        // empty arm is unreachable and yields a harmless degenerate tree rather than panicking.
+        // 256 entries always reduce to exactly one node; the empty arm is unreachable (degenerate, not a panic).
         let root = match list.pop() {
             Some(node) => node.node,
             None => Node::Leaf(0),
@@ -110,8 +92,7 @@ fn insert_sorted(list: &mut Vec<WeightedNode>, node: WeightedNode) {
 fn assign_codes(node: &Node, path: &mut Vec<bool>, codes: &mut [Vec<bool>]) {
     match node {
         Node::Leaf(byte) => {
-            // A degenerate single-symbol tree would leave an empty path; the SA-MP table never
-            // produces one, but keep the encoding non-empty so decode terminates.
+            // Keep a degenerate single-symbol encoding non-empty so decode terminates (SA-MP table never hits this).
             codes[*byte as usize] = if path.is_empty() {
                 vec![false]
             } else {
@@ -150,9 +131,7 @@ pub fn encode_string(input: &[u8]) -> Vec<u8> {
     })
 }
 
-/// Decode a SA-MP encoded string: read the compressed `u16` bit length, then walk the Huffman tree
-/// for that many bits, emitting at most `max_len` bytes. Matches `StringCompressor::DecodeString` /
-/// `bs:readEncoded(max_len)`. A truncated/exhausted stream stops early rather than erroring.
+/// Decode a SA-MP encoded string (compressed `u16` bit length + Huffman bits), emitting ≤ `max_len` bytes; a truncated stream stops early.
 pub fn decode_string(data: &[u8], max_len: usize) -> Vec<u8> {
     TREE.with(|tree| {
         let mut reader = BitStreamReader::new(data);

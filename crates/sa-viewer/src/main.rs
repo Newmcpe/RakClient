@@ -99,8 +99,8 @@ fn main() {
         scene.streamed.triangle_count(),
         scene.holes.len(),
     );
-    let mesh = scene.base;
-    let streamed = scene.streamed;
+    let mut mesh = scene.base;
+    let mut streamed = scene.streamed;
     let holes = scene.holes;
 
     // Optional overlay: a `.nav` navmesh from `navgen` — walkable detail triangles in SA space,
@@ -151,6 +151,46 @@ fn main() {
         Vec::new()
     };
 
+    // Cull the collision geometry to the sawmill working area before uploading it. The baked scene holds
+    // the ENTIRE base world (~22 M tris); expanded to a non-indexed render mesh that is ~66 M vertices,
+    // which pressures an 8 GB GPU into intermittent driver resets (the "viewer crashes"). Keep only
+    // triangles near the navmesh (its XY bounds + margin) — a few hundred K — so the upload is small and
+    // stable. With no navmesh, fall back to a fixed sawmill box (navgen's default region), overridable
+    // via SA_VIEW_BOX="cx,cy,half".
+    let (bx0, bx1, by0, by1) = if !nav_tris.is_empty() {
+        let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for t in &nav_tris {
+            for v in t {
+                x0 = x0.min(v[0]);
+                x1 = x1.max(v[0]);
+                y0 = y0.min(v[1]);
+                y1 = y1.max(v[1]);
+            }
+        }
+        let m = 60.0;
+        (x0 - m, x1 + m, y0 - m, y1 + m)
+    } else {
+        let (cx, cy, half) = std::env::var("SA_VIEW_BOX")
+            .ok()
+            .and_then(|s| {
+                let p: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if p.len() == 3 {
+                    Some((p[0], p[1], p[2]))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((-520.0, -190.0, 450.0));
+        (cx - half, cx + half, cy - half, cy + half)
+    };
+    let before = mesh.triangle_count();
+    mesh = cull_mesh(&mesh, bx0, bx1, by0, by1);
+    streamed = cull_mesh(&streamed, bx0, bx1, by0, by1);
+    println!(
+        "culled to view box [{bx0:.0}..{bx1:.0}, {by0:.0}..{by1:.0}]: {before} → {} base tris",
+        mesh.triangle_count(),
+    );
+
     println!(
         "loaded {} triangles ({} vertices), {} unplaced-object markers — opening viewer…\ncontrols: CLICK to look (Esc release) · WASD move · Space/Ctrl up/down · Shift boost · H toggle markers · P print pos · 1/2 path start/end · C clear path",
         mesh.triangle_count(),
@@ -189,6 +229,30 @@ fn main() {
             ),
         )
         .run();
+}
+
+/// Keep only triangles of `m` with at least one vertex inside the SA-XY box, remapped to a compact
+/// vertex list. Shrinks the whole-world scene mesh to the region actually being viewed so the GPU upload
+/// stays small (the un-culled ~22 M-tri world is what tips an 8 GB card into driver-reset crashes).
+fn cull_mesh(m: &sa_map::world::Mesh, x0: f32, x1: f32, y0: f32, y1: f32) -> sa_map::world::Mesh {
+    let inbox = |p: [f32; 3]| p[0] >= x0 && p[0] <= x1 && p[1] >= y0 && p[1] <= y1;
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        if !t.iter().any(|&i| inbox(m.positions[i as usize])) {
+            continue;
+        }
+        for &gi in t {
+            let ni = *remap.entry(gi).or_insert_with(|| {
+                let idx = positions.len() as u32;
+                positions.push(m.positions[gi as usize]);
+                idx
+            });
+            indices.push(ni);
+        }
+    }
+    sa_map::world::Mesh { positions, indices }
 }
 
 fn setup(

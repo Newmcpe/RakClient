@@ -1,7 +1,5 @@
 //! RPC and sync packet identifiers (verified against the binary's RPC id table & sync sender).
-//!
-//! `TryFrom<u8>` / `From<Self> for u8` come from `num_enum`; the variant list (`Self::VARIANTS`,
-//! the equivalent of Java's `Enum.values()`) comes from `strum::VariantArray`.
+//! `TryFrom`/`Into<u8>` via `num_enum`; `VARIANTS` via `strum::VariantArray`.
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use strum::VariantArray;

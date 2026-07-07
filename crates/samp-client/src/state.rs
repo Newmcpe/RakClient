@@ -1,10 +1,5 @@
 //! The high-level local-player model, shared between the driver (authoritative sync) and the script
-//! engine's `getBot*`/`setBot*` bindings.
-//!
-//! [`LocalPlayer`] composes typed sub-states — on-foot, in-vehicle, aim/camera and weapon inventory
-//! — plus identity/world fields and the driver-control flags. The driver builds outgoing sync from
-//! it and folds incoming RPCs back into it; native features (e.g. client emulation) read and write the
-//! same model. Wire (de)serialisation stays in `samp-proto`; this is the in-memory view above it.
+//! engine's `getBot*`/`setBot*` bindings; see docs/memory/samp-client/state.md#module.
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -22,7 +17,7 @@ pub struct OnFootData {
     pub armour: u8,
     pub weapon: u8,
     pub special_action: u8,
-    /// Reported velocity vector. A moving position with a zero `move_speed` is a teleport/speed-hack
+    /// Reported velocity vector — a moving position with a zero `move_speed` is the teleport/speed-hack
     /// signature the anti-cheat flags, so movement scripts must set a plausible velocity here.
     pub move_speed: Vector3,
     /// On-foot animation id/flags to report (0 id = "no animation override").

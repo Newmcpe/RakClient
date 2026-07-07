@@ -1,9 +1,5 @@
-//! RakNet-compatible bit stream, ported from `BitStream_WriteBits` (0x402180) and
-//! `BitStream_ReadBits` (0x4022B0).
-//!
-//! Bit order: each source byte is packed most-significant-bit first into the stream. Multi-byte
-//! integers are first laid out little-endian, then bit-packed, so a fully byte-aligned stream is
-//! identical to a plain little-endian buffer.
+//! RakNet-compatible bit stream (`BitStream_WriteBits` @0x402180 / `BitStream_ReadBits` @0x4022B0);
+//! bit order and layout: see docs/memory/samp-proto/bitstream.md#bit-order
 
 use crate::{ProtoError, Result};
 
@@ -23,9 +19,7 @@ impl BitStreamWriter {
         self.num_bits
     }
 
-    /// Core writer: packs `num_bits` from `input` (MSB-first per byte) at the current position.
-    /// `right_aligned` only affects a trailing partial (`< 8`) byte, matching the binary's
-    /// `rightAlignedBits` argument. `input` must hold at least `ceil(num_bits / 8)` bytes.
+    /// Core writer: packs `num_bits` from `input` (MSB-first, `right_aligned` affects only a trailing partial byte); `input` must hold `ceil(num_bits / 8)` bytes.
     fn write_bits(&mut self, input: &[u8], mut num_bits_to_write: usize, right_aligned: bool) {
         if num_bits_to_write == 0 {
             return;
@@ -73,8 +67,7 @@ impl BitStreamWriter {
         self.write_bits(&[value as u8], 1, true);
     }
 
-    /// Write the low `count` (`<= 8`) bits of `value`, MSB-first, matching RakNet
-    /// `BitStream::WriteBits(&value, count, true)`.
+    /// Write the low `count` (`<= 8`) bits of `value`, MSB-first (RakNet `WriteBits(&value, count, true)`).
     pub fn write_bits_low(&mut self, value: u8, count: usize) {
         self.write_bits(&[value], count, true);
     }
@@ -87,10 +80,7 @@ impl BitStreamWriter {
         }
     }
 
-    /// RakNet `BitStream::WriteCompressed` for an unsigned little-endian value: high zero bytes are
-    /// each encoded as a single `1` bit; the first non-zero byte is preceded by a `0` bit followed by
-    /// every byte from that point down to the lowest; the lowest byte is encoded as `1`+low-nibble
-    /// when its high nibble is zero, otherwise `0`+full-byte.
+    /// RakNet `BitStream::WriteCompressed` (unsigned LE); encoding: see docs/memory/samp-proto/bitstream.md#write-compressed
     fn write_compressed(&mut self, input: &[u8]) {
         let mut current_byte = input.len() - 1;
         while current_byte > 0 {
@@ -144,8 +134,7 @@ impl BitStreamWriter {
         self.write_bits(bytes, bytes.len() * 8, true);
     }
 
-    /// Length-prefixed string with a single `u8` length byte (SA-MP convention). Strings longer
-    /// than 255 bytes are truncated to 255 to keep the length prefix well-defined.
+    /// Length-prefixed string with a single `u8` length byte (SA-MP); truncated to 255 bytes.
     pub fn write_str8(&mut self, value: &str) {
         let bytes = value.as_bytes();
         let len = bytes.len().min(u8::MAX as usize);
@@ -175,8 +164,7 @@ impl<'a> BitStreamReader<'a> {
         (self.data.len() * 8).saturating_sub(self.bit_pos)
     }
 
-    /// Core reader: extracts `num_bits` (MSB-first per byte) into a fresh buffer, mirroring the
-    /// binary. Returns [`ProtoError::Exhausted`] when the stream does not hold enough bits.
+    /// Core reader: extracts `num_bits` (MSB-first) into a fresh buffer; [`ProtoError::Exhausted`] when short.
     fn read_bits(&mut self, num_bits_to_read: usize, align_right: bool) -> Result<Vec<u8>> {
         if num_bits_to_read == 0 {
             return Ok(Vec::new());
@@ -232,8 +220,7 @@ impl<'a> BitStreamReader<'a> {
         Ok(self.read_bits(1, true)?[0] != 0)
     }
 
-    /// Read `count` (`<= 8`) bits, MSB-first, returning them right-aligned in the low bits of the
-    /// result (RakNet `BitStream::ReadBits(&value, count, true)`).
+    /// Read `count` (`<= 8`) bits, MSB-first, returned right-aligned in the low bits (RakNet `ReadBits(&value, count, true)`).
     pub fn read_bits_low(&mut self, count: usize) -> Result<u8> {
         Ok(self.read_bits(count, true)?[0])
     }
@@ -308,9 +295,7 @@ impl<'a> BitStreamReader<'a> {
         self.read_bits(len * 8, true)
     }
 
-    /// Read exactly `num_bits` bits (consuming only that many), returning them packed MSB-first
-    /// into `ceil(num_bits / 8)` bytes. Mirrors RakNet `ReadBits(.., num_bits, false)`, used for
-    /// RPC bodies whose bit length is not a multiple of 8.
+    /// Read exactly `num_bits` bits packed MSB-first into `ceil(num_bits / 8)` bytes (RakNet `ReadBits(.., false)`), for non-byte-aligned RPC bodies.
     pub fn read_bits_bytes(&mut self, num_bits: usize) -> Result<Vec<u8>> {
         self.read_bits(num_bits, false)
     }

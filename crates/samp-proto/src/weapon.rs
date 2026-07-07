@@ -1,7 +1,5 @@
-//! SA-MP weapon inventory wire support: the per-slot snapshot a client streams via
-//! `PACKET_WEAPONS_UPDATE` (204), plus the weapon→slot and weapon→state lookup tables. Pure
-//! protocol knowledge — the decision of *when* to send and *what* the inventory holds is the
-//! caller's (see `samp-client`).
+//! SA-MP weapon inventory wire support: the `PACKET_WEAPONS_UPDATE` (204) per-slot snapshot plus
+//! weapon→slot / weapon→state lookup tables (when/what to send is the caller's, see `samp-client`).
 
 use crate::BitStreamWriter;
 
@@ -48,9 +46,7 @@ pub fn weapon_state(weapon: u8) -> u8 {
     }
 }
 
-/// Encode the `PACKET_WEAPONS_UPDATE` (204) body: two `0xFFFF` words (unused player/vehicle ids)
-/// followed by every slot as `[u8 slot][u8 weapon][u16 ammo]`. The id byte is prepended by the
-/// transport.
+/// Encode the `PACKET_WEAPONS_UPDATE` (204) body: two `0xFFFF` words then each slot as `[u8 slot][u8 weapon][u16 ammo]`.
 pub fn encode_weapons_update(slots: &[WeaponSlot; WEAPON_SLOTS]) -> Vec<u8> {
     let mut w = BitStreamWriter::new();
     w.write_u16(0xFFFF);

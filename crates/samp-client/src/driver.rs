@@ -1,10 +1,5 @@
-//! The connection state machine.
-//!
-//! [`Driver`] is generic over a [`Transport`] so it can be unit-tested against a scripted fake while
-//! production instantiates it with the real RakNet transport. Packet bodies are encoded/decoded
-//! through the [`samp_proto::Encode`]/[`samp_proto::Decode`] traits on each packet struct. It is
-//! pumped one event at a time through [`Driver::next_event`], which internally `select!`s over
-//! incoming transport events, the on-foot sync interval (while `Spawned`), and the reconnect timer.
+//! The connection state machine: [`Driver`] is generic over a [`Transport`] and pumped one event at a
+//! time through [`Driver::next_event`]; see docs/memory/samp-client/driver.md#module.
 
 use std::collections::VecDeque;
 use std::future;
@@ -36,24 +31,20 @@ use crate::{ClientConfig, ClientEvent, ConnectionState};
 /// How often the registry's `on_update` handlers fire while connected (drives script timers).
 const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// When the bot's on-foot state is unchanged, resend a keepalive sync at most this often instead of
-/// every `sync_interval` tick. Matches the real client's floor: samp.dll's on-foot/aim senders
-/// (`sub_10004D40`/`sub_10005040`) force a resend once `GetTickCount - last > 0x1F4` (500 ms) even when
-/// the packet is byte-identical, so a stationary player still reports at ≥2 Hz.
+/// Keepalive resend floor for an unchanged on-foot state (≥2 Hz); see
+/// docs/memory/samp-client/driver.md#idle-sync-interval.
 const IDLE_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How often the client reports its stats (`PACKET_STATS_UPDATE` = 205, money + drunk) while spawned.
-/// The real client sends this every second (`NetGame_Process` gate `TickCount - last > 0x3E8`).
+/// Stats-report cadence (`PACKET_STATS_UPDATE` = 205) while spawned; see
+/// docs/memory/samp-client/driver.md#stats-interval.
 const STATS_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Base offset for the Arizona 221/53 `timestamp_ms` so it resembles a plausible `GetTickCount` uptime
 /// (the server only requires it to strictly increase within a session); the elapsed ms are added on.
 const ARIZONA_TS_BASE: u32 = 200_000_000;
 
-/// RakNet ordering channel for all player sync (on-foot 207, aim 203, spectator 212). The real client
-/// sends sync on channel 1, keeping it off channel 0 which carries the reliable-ordered RPC stream —
-/// verified against samp.dll's sync senders (`sub_10004D40`/`sub_10005040`/`sub_10006320`, all
-/// `Send(..., orderingChannel = 1)`). We previously sent sync on channel 0, mixing it with RPCs.
+/// RakNet ordering channel for all player sync (on-foot 207, aim 203, spectator 212), off the RPC
+/// channel 0; see docs/memory/samp-client/driver.md#sync-channel.
 const SYNC_CHANNEL: u8 = 1;
 
 /// Arizona's CEF/validation packet family: raw packet id 220, sub-id in the second byte. Logged
@@ -68,9 +59,7 @@ const ARIZONA_SYNC_ASSIGN_SUB: u8 = 113;
 const SPAWN_HEALTH: u8 = 100;
 
 /// Fallback spawn position for [`Driver::enter_spawned`] when the server never sent `SetSpawnInfo`
-/// (the self-spawn fallback path). Decoded from a real captured `SetSpawnInfo` body on Arizona's
-/// Bumble Bee server (`[u8 team=255][u32 skin][u8 unused][f32 x,y,z,zAngle]...`, floats at byte
-/// offsets 6/10/14/18) rather than defaulting to the map origin.
+/// (decoded from a real Arizona capture); see docs/memory/samp-client/driver.md#fallback-spawn-position.
 const FALLBACK_SPAWN_POSITION: Vector3 = Vector3 {
     x: 1765.50,
     y: -1892.70,
@@ -85,20 +74,16 @@ enum Step {
     Update,
 }
 
-/// A locomotion gait, reverse-engineered from a live GTA-SA/Arizona on-foot (207)
-/// capture of CJ walking / jogging / sprinting (median over 397 outbound syncs).
-/// The receiving clients animate a remote player from `up_down` + `keys` +
-/// `move_speed`, so matching all three reproduces the real walk/run/sprint look
-/// and speed — unlike the old fly.luau coordmaster (a fixed ~35 u/s fast-travel,
-/// ~3.7× real sprint, one static anim).
+/// A locomotion gait, reverse-engineered from a live GTA-SA/Arizona on-foot (207) capture; see
+/// docs/memory/samp-client/driver.md#gait.
 #[derive(Clone, Copy)]
 struct Gait {
     /// World speed in units/second (position advance rate).
     speed: f32,
-    /// Reported `move_speed` vector magnitude (≈ `speed / 49` in the capture).
+    /// Reported `move_speed` vector magnitude; MUST equal `speed / 50` or the remote drifts then snaps.
+    /// See docs/memory/samp-client/driver.md#gait-move-speed-mag.
     move_speed_mag: f32,
-    /// On-foot key bits: 0 = jog (default forward run), `KEY_SPRINT` = sprint,
-    /// `KEY_WALK` = walk.
+    /// On-foot key bits: 0 = jog (default forward run), `KEY_SPRINT` = sprint, `KEY_WALK` = walk.
     keys: u16,
     /// Representative animation (index, flags) the real client sends for this gait.
     anim: (u16, u16),
@@ -111,26 +96,26 @@ const KEY_WALK: u16 = 0x0400;
 /// Up/down analog value the real client sends while moving forward.
 const ANALOG_FORWARD: i16 = -128;
 
-/// Slow walk (KEY_WALK held): ~3.7 u/s, `move_speed` ~0.066.
+/// Slow walk (KEY_WALK held): 1.556 u/s; see docs/memory/samp-client/driver.md#gait-walk.
 const GAIT_WALK: Gait = Gait {
-    speed: 3.7,
-    move_speed_mag: 0.066,
+    speed: 1.556,
+    move_speed_mag: 0.0311, // 1.556 / 50 — must track `speed` or the remote drifts then snaps
     keys: KEY_WALK,
-    anim: (1189, 0x8004),
+    anim: (1231, 0x8004),
 };
-/// Default jog (push forward, no modifier): ~5.4 u/s, `move_speed` ~0.109.
+/// Default jog (push forward, no modifier): 5.7 u/s; see docs/memory/samp-client/driver.md#gait-jog.
 const GAIT_JOG: Gait = Gait {
-    speed: 5.4,
-    move_speed_mag: 0.109,
+    speed: 5.7,
+    move_speed_mag: 0.114, // 5.7 / 50
     keys: 0,
     anim: (1231, 0x8004),
 };
-/// Sprint (KEY_SPRINT held): ~9.4 u/s, `move_speed` ~0.193.
+/// Sprint (KEY_SPRINT held): 9.56 u/s; see docs/memory/samp-client/driver.md#gait-sprint.
 const GAIT_SPRINT: Gait = Gait {
-    speed: 9.4,
-    move_speed_mag: 0.193,
+    speed: 9.56,
+    move_speed_mag: 0.1912, // 9.56 / 50
     keys: KEY_SPRINT,
-    anim: (1196, 0x8064),
+    anim: (1231, 0x8002),
 };
 
 /// Resolve a `walkTo` mode byte (0 = walk, 1 = jog, 2 = sprint) to its [`Gait`].
@@ -142,20 +127,42 @@ fn gait_for_mode(mode: u8) -> Gait {
     }
 }
 
-/// Native navmesh walk in progress. Advances the position at the gait's real world
-/// speed (time-based, so any sync cadence is smooth), reporting the matching
-/// analog/keys/move_speed/anim so it reads as a genuine walk/jog/sprint.
+/// Native navmesh walk in progress, advancing the position at the gait's real world speed; see
+/// docs/memory/samp-client/driver.md#walkstate.
 struct WalkState {
     waypoints: Vec<samp_proto::Vector3>,
     next: usize,
     gait: Gait,
     last_step: Option<Instant>,
+    /// Current facing/travel heading (SA φ = atan2(dx, dy)), slewed toward the waypoint bearing at
+    /// `TURN_RATE`; see docs/memory/samp-client/driver.md#walkstate-heading.
+    heading: Option<f32>,
+    /// Current fraction (0..1) of the gait's full speed, ramped up from a standstill and braked into
+    /// the stop; see docs/memory/samp-client/driver.md#walkstate-speed-frac.
+    speed_frac: f32,
     /// Where the walk ends — reported in `ClientEvent::WalkArrived`.
     target: samp_proto::Vector3,
 }
 
-/// Stop when within this many units of the final target.
-const WALK_ARRIVE: f32 = 2.0;
+/// Max facing turn rate while walking, rad/s, slewed so corners read as a natural turn; see
+/// docs/memory/samp-client/driver.md#turn-rate.
+const TURN_RATE: f32 = 7.85; // ~450°/s, the real client's observed hairpin rate
+
+/// Speed ramp-up rate, fraction-of-gait per second (full gait in ~1 s, matching the real client's
+/// measured moveBlendRatio run-up); see docs/memory/samp-client/driver.md#walk-accel.
+const WALK_ACCEL: f32 = 1.0;
+/// Horizontal distance to the final target within which `speed_frac` is capped so the ped decelerates
+/// into its stop; kept a bit above `WALK_ARRIVE`.
+const WALK_BRAKE_DIST: f32 = 2.5;
+
+/// Stop when within this many units of the final target, well under the remote's 2 m/1 m snap
+/// threshold; see docs/memory/samp-client/driver.md#walk-arrive.
+const WALK_ARRIVE: f32 = 1.0;
+
+/// Ped-origin height above the navmesh floor — measured but NOT applied (would trip the fly-hack AC);
+/// kept for future bake-time work. See docs/memory/samp-client/driver.md#ped-ground-offset.
+#[allow(dead_code)]
+const PED_GROUND_OFFSET: f32 = 0.8;
 
 pub(crate) struct Driver<T: Transport> {
     config: ClientConfig,
@@ -194,8 +201,8 @@ pub(crate) struct Driver<T: Transport> {
     /// Mirrors RakSAMP Lite's `g_bSpawnRequested`: set when we send `RequestSpawn` (via
     /// `sampSpawnPlayer()`), so a non-2 `RequestSpawnResponse` allow still spawns us.
     spawn_requested: bool,
-    /// Mirrors RakSAMP Lite's `g_bSpectating`: the last `TogglePlayerSpectating` value from the server.
-    /// A `1 → 0` transition is the server dropping us out of spectate → spawn (the Arizona trigger).
+    /// Mirrors RakSAMP Lite's `g_bSpectating`: last `TogglePlayerSpectating` from the server, whose
+    /// `1 → 0` transition is the Arizona spawn trigger.
     server_spectating: bool,
     /// Position from `SetSpawnInfo` (RPC 68); `enter_spawned` loads it into the sync position,
     /// mirroring RakSAMP Lite's `Net_Spawn` — without this the bot reports 0,0,0 after spawn.
@@ -205,16 +212,14 @@ pub(crate) struct Driver<T: Transport> {
     class_selected_at: Option<Instant>,
     /// Driver-creation instant; the monotonic base for the Arizona 221/53 `timestamp_ms` field.
     created_at: Instant,
-    /// Streamer entity id the server assigns us via inbound `221/113` (`[0xDD][0x71][0x00][u16 id]`).
-    /// Our outbound `221/53` sync must report THIS id, not our SA-MP player id, or the server's
-    /// streamer watchdog treats the entity's sync as ignored ("Игнорирование функции(52 / 1)").
+    /// Streamer entity id the server assigns via inbound `221/113` — our outbound `221/53` must report
+    /// it, not our player id. See docs/memory/samp-client/driver.md#arizona-streamer-id.
     arizona_streamer_id: Option<u16>,
     /// Consecutive reconnect attempts since the last stable session. Caps a kick/reject loop so a
     /// server that keeps dropping us right back out doesn't spin the client forever.
     reconnect_attempts: u32,
-    /// When we last reached a stable in-game state (`Spawned`). A session that survived at least
-    /// [`STABLE_SESSION`] before dropping resets the attempt cap — a genuine one-off disconnect
-    /// reconnects freely, while a spawn→instant-kick loop keeps accumulating toward the cap.
+    /// When we last reached `Spawned`; a session lasting ≥[`STABLE_SESSION`] before dropping resets the
+    /// reconnect-attempt cap. See docs/memory/samp-client/driver.md#on-disconnect-reconnect.
     connected_since: Option<Instant>,
 }
 
@@ -337,10 +342,8 @@ impl<T: Transport> Driver<T> {
         }
     }
 
-    /// Send everything scripts queued via `sampSendPacket`/`sampSendRpc` since the last drain, each
-    /// with the reliability/channel the script asked for (`sendPacket()` defaults to
-    /// reliable-ordered on channel 0 — the Arizona `220` path). Outgoing packets pass through the
-    /// `onSendPacket` chokepoint first.
+    /// Send everything scripts queued since the last drain (through the `onSendPacket` chokepoint), each
+    /// with its requested reliability/channel; see docs/memory/samp-client/driver.md#flush-outbox.
     async fn flush_outbox(&mut self) {
         for msg in self.registry.drain_outbox() {
             let msg = match msg {
@@ -467,12 +470,14 @@ impl<T: Transport> Driver<T> {
                         .map(|p| samp_proto::Vector3 {
                             x: p[0],
                             y: p[1],
-                            z: p[2],
+                            z: p[2], // stay on the ground-sampled nav floor — see PED_GROUND_OFFSET note
                         })
                         .collect(),
                     next: 0,
                     gait,
                     last_step: None,
+                    heading: None,
+                    speed_frac: 0.0,
                     target,
                 });
                 self.set_walking_flag(true);
@@ -506,8 +511,19 @@ impl<T: Transport> Driver<T> {
         self.sync.left_right = 0;
         self.sync.keys = 0;
         self.sync.move_speed = samp_proto::Vector3::default();
-        self.sync.animation_id = 0;
-        self.sync.animation_flags = 0;
+        // Idle stance anim, NOT (0,0), which is a headless fingerprint; see
+        // docs/memory/samp-client/driver.md#set-standing.
+        self.sync.animation_id = 1189;
+        self.sync.animation_flags = 0x8004;
+        // Also clear the shared state so a leftover walk velocity can't leak back into idle syncs; see
+        // docs/memory/samp-client/driver.md#set-standing.
+        if let Some(state) = &self.bot_state {
+            let mut s = state.borrow_mut();
+            s.on_foot.keys = 0;
+            s.on_foot.move_speed = samp_proto::Vector3::default();
+            s.on_foot.animation_id = 1189;
+            s.on_foot.animation_flags = 0x8004;
+        }
     }
 
     /// Mirror the walker liveness into the shared state for `isWalking()`.
@@ -517,28 +533,33 @@ impl<T: Transport> Driver<T> {
         }
     }
 
-    /// Advance the active walk by real elapsed time at the gait's world speed, and
-    /// report the matching forward-analog + keys + move_speed + animation so it
-    /// reads as a genuine walk/jog/sprint. Runs inside the spawned sync send path,
-    /// after `mirror_from_state` so the walker overrides script writes.
+    /// Advance the active walk by real elapsed time at the gait's world speed, reporting the matching
+    /// analog/keys/move_speed/animation; runs after `mirror_from_state` so the walker overrides scripts.
     fn step_walk(&mut self) {
         let Some(mut walk) = self.walk.take() else {
             return;
         };
         let now = Instant::now();
-        // Time-based advance: distance = speed * dt. First tick primes the clock
-        // (no jump); afterwards the position moves at the true gait speed regardless
-        // of the sync cadence. dt is clamped so a stall can't teleport the bot.
+        // Time-based advance (distance = speed * dt); first tick primes the clock, dt clamped so a stall
+        // can't teleport the bot.
         let dt = match walk.last_step {
             Some(at) => now.duration_since(at).as_secs_f32().min(0.5),
             None => 0.0,
         };
         walk.last_step = Some(now);
-        let advance = walk.gait.speed * dt;
 
         let pos = self.sync.position;
-        // Retarget: skip waypoints already within this step's reach.
-        let (mut dx, mut dy, mut dz, mut d);
+        // Ramp speed up from a standstill and brake it near the target; `frac` scales both position
+        // advance and move_speed so the ×50 invariant holds. See docs/memory/samp-client/driver.md#step-walk-ramp.
+        walk.speed_frac = (walk.speed_frac + WALK_ACCEL * dt).min(1.0);
+        let dist_to_target =
+            ((walk.target.x - pos.x).powi(2) + (walk.target.y - pos.y).powi(2)).sqrt();
+        let brake = (dist_to_target / WALK_BRAKE_DIST).clamp(0.2, 1.0);
+        let frac = walk.speed_frac.min(brake);
+        let advance = walk.gait.speed * frac * dt;
+        // Retarget: skip waypoints within reach. Distances are HORIZONTAL (z tracked separately); see
+        // docs/memory/samp-client/driver.md#step-walk-retarget.
+        let (mut dx, mut dy, mut d);
         loop {
             let Some(wp) = walk.waypoints.get(walk.next) else {
                 // Path exhausted: arrived.
@@ -559,8 +580,8 @@ impl<T: Transport> Driver<T> {
                 );
                 return;
             };
-            (dx, dy, dz) = (wp.x - pos.x, wp.y - pos.y, wp.z - pos.z);
-            d = (dx * dx + dy * dy + dz * dz).sqrt();
+            (dx, dy) = (wp.x - pos.x, wp.y - pos.y);
+            d = (dx * dx + dy * dy).sqrt();
             let last = walk.next + 1 == walk.waypoints.len();
             let reach = if last { WALK_ARRIVE } else { advance.max(0.5) };
             if d > reach {
@@ -569,26 +590,72 @@ impl<T: Transport> Driver<T> {
             walk.next += 1;
         }
 
-        let inv = 1.0 / d;
-        let (ux, uy, uz) = (dx * inv, dy * inv, dz * inv);
-        // Never overshoot the current waypoint in one step.
-        let step = advance.min(d);
-        let jitter = |scale: f32| (rand::random::<f32>() * 2.0 - 1.0) * scale;
-        self.sync.position = samp_proto::Vector3 {
-            x: pos.x + ux * step,
-            y: pos.y + uy * step,
-            z: pos.z + uz * step + jitter(0.02),
+        // Bearing toward the current waypoint, then SLEW the travel heading toward it at TURN_RATE so
+        // position/facing/move_speed stay consistent through a corner; see docs/memory/samp-client/driver.md#step-walk-slew.
+        let hlen = (dx * dx + dy * dy).sqrt();
+        let target_bearing = if hlen > 1e-4 { dx.atan2(dy) } else { 0.0 };
+        let heading = match walk.heading {
+            Some(h) if hlen > 1e-4 => {
+                let mut diff = target_bearing - h;
+                while diff > std::f32::consts::PI {
+                    diff -= std::f32::consts::TAU;
+                }
+                while diff < -std::f32::consts::PI {
+                    diff += std::f32::consts::TAU;
+                }
+                let max_step = TURN_RATE * dt;
+                h + diff.clamp(-max_step, max_step)
+            }
+            _ => target_bearing, // first move tick (or degenerate): snap, no spin
         };
-        // Report the gait: forward analog + movement keys + a velocity of the
-        // gait's magnitude in the travel direction + the gait animation.
-        let mag = walk.gait.move_speed_mag;
+        walk.heading = Some(heading);
+        // Unit travel direction from the slewed heading (φ = atan2(dx, dy) ⇒ dir = (sin φ, cos φ)).
+        let (hx, hy) = (heading.sin(), heading.cos());
+        // Advance horizontally, never overshooting the waypoint.
+        let hstep = advance.min(hlen);
+        let jitter = |scale: f32| (rand::random::<f32>() * 2.0 - 1.0) * scale;
+        // Track z toward the CURRENT waypoint's grounded z (proportional to horizontal progress) so the
+        // path hugs terrain instead of diving; see docs/memory/samp-client/driver.md#step-walk-z.
+        let wp_z = walk
+            .waypoints
+            .get(walk.next)
+            .map(|w| w.z)
+            .unwrap_or(walk.target.z);
+        let nz = if hlen > 1e-3 {
+            pos.z + (wp_z - pos.z) * (hstep / hlen).min(1.0)
+        } else {
+            wp_z
+        };
+        self.sync.position = samp_proto::Vector3 {
+            x: pos.x + hx * hstep,
+            y: pos.y + hy * hstep,
+            z: nz + jitter(0.02),
+        };
+        // Report the real gait (analog + keys + 3-D velocity + anim); AC-valid since the (w,x,y,z) codec
+        // fly-hack fix. See docs/memory/samp-client/driver.md#step-walk-gait.
+        let mag = walk.gait.move_speed_mag * frac;
         self.sync.up_down = ANALOG_FORWARD;
         self.sync.left_right = 0;
+        // Face the (slewed) travel heading: quaternion about world +Z, forward=(dx, dy), serialized
+        // w-first. See docs/memory/samp-client/driver.md#step-walk-gait.
+        self.sync.quaternion = Quaternion {
+            x: 0.0,
+            y: 0.0,
+            z: (heading * 0.5).sin(),
+            w: (heading * 0.5).cos(),
+        };
         self.sync.keys = walk.gait.keys;
+        // Velocity tracks true 3-D motion (a moving position with zero move_speed reads as a teleport);
+        // z = grade × gait magnitude. See docs/memory/samp-client/driver.md#step-walk-gait.
+        let vz = if hstep > 1e-4 {
+            mag * (nz - pos.z) / hstep
+        } else {
+            0.0
+        };
         self.sync.move_speed = samp_proto::Vector3 {
-            x: ux * mag,
-            y: uy * mag,
-            z: uz * mag,
+            x: hx * mag,
+            y: hy * mag,
+            z: vz,
         };
         self.sync.animation_id = walk.gait.anim.0;
         self.sync.animation_flags = walk.gait.anim.1;
@@ -618,9 +685,8 @@ impl<T: Transport> Driver<T> {
         if let Some((target, mode)) = walk_to {
             self.start_walk(target, mode);
         }
-        // `sampSpawnPlayer()` — explicit spawn request (RakSAMP Lite's "reqspawn"). Usually NOT needed
-        // (the server drives the spawn via RequestSpawnResponse(allow==2) after login); this is the
-        // manual override. Sets `spawn_requested` so a non-2 allow still spawns us.
+        // `sampSpawnPlayer()` — explicit manual spawn override (usually unneeded; the server drives the
+        // spawn after login); sets `spawn_requested` so a non-2 allow still spawns us.
         if spawn_requested && self.spectating {
             self.request_spawn().await;
         }
@@ -692,18 +758,16 @@ impl<T: Transport> Driver<T> {
                 challenge_response,
                 auth: gpci.as_str(),
                 client_version: self.config.client_version.as_str(),
-                // Append the trailing `challengeResponse2` whenever a script is attached, so a Lua
-                // `onSendClientJoin` rewrite (e.g. the Arizona variant) has the 7th field to keep.
-                // Vanilla servers ignore the trailing bytes, so this is safe.
+                // Append the trailing `challengeResponse2` (7th field) whenever a script is attached so a
+                // Lua `onSendClientJoin` rewrite can keep it; vanilla servers ignore the trailing bytes.
                 duplicate_challenge_response: self.bot_state.is_some(),
             };
             join.encode()
         };
         self.transition(ConnectionState::RakNetConnected);
         self.pending.push_back(ClientEvent::Connected);
-        // The join goes through the `onSendRPC` chokepoint, so a script can rewrite it before it
-        // hits the wire. Scripts send their own post-join packets (e.g. Arizona CEF) on `onConnect`;
-        // the outbox is flushed after this step.
+        // The join goes through the `onSendRPC` chokepoint so a script can rewrite it before the wire;
+        // scripts send their own post-join packets on `onConnect` (outbox flushed after this step).
         self.send_rpc(RpcId::ClientJoin as u8, payload).await;
         self.registry.dispatch_lifecycle("onConnect");
         self.transition(ConnectionState::Joining);
@@ -942,17 +1006,14 @@ impl<T: Transport> Driver<T> {
             local_id: self.local_id,
             host_name,
         });
-        // A script's post-join packets (e.g. a server's validation sequence) go out on `onInitGame`
-        // or on its own Lua `wait()`-timed task; the normal class → spawn flow proceeds immediately.
-        // Servers that need validation only require it within a window, not strictly before spawn.
+        // A script's post-join packets fire on `onInitGame` (or its own Lua `wait()` task) while the
+        // normal class → spawn flow proceeds immediately — validation is window-gated, not pre-spawn.
         self.registry.dispatch_lifecycle("onInitGame");
         self.flush_outbox().await;
         self.request_spawn_class().await;
     }
 
-    /// After join, spectate and start the pre-spawn poll. Like RakSAMP Lite (`client_app.cpp`) we send
-    /// `RequestClass` now and re-send it every second (plus the score/ping) until the server sends
-    /// `SetSpawnInfo`; the spawn is then driven by the class response (with spawn info),
+    /// After join, spectate and send `RequestClass`; the spawn is later driven by the class response,
     /// `RequestSpawnResponse(allow==2)`, or `TogglePlayerSpectating(1→0)`.
     async fn request_spawn_class(&mut self) {
         self.spectating = true;
@@ -971,19 +1032,11 @@ impl<T: Transport> Driver<T> {
         self.send_rpc(RpcId::RequestSpawn as u8, payload).await;
     }
 
-    /// Pre-spawn tick while spectating: only the optional self-spawn fallback runs here. A real
-    /// client sends neither a periodic `RequestClass` re-request nor an automatic `UpdateScoresPingsIPs`
-    /// heartbeat while waiting to spawn (live capture: `RequestClass` never appears in a real client's
-    /// outbound traffic at all, and `UpdateScoresPingsIPs` only fires once, user-triggered by opening
-    /// the scoreboard, hours into a session — never automatically near join). Sending either on a
-    /// steady 1s cadence during the exact window the server decides whether to grant a spawn is a
-    /// distinctive non-human traffic pattern a server could key an anti-bot check on, so we don't.
+    /// Pre-spawn tick while spectating: only the optional self-spawn fallback runs (no periodic
+    /// `RequestClass`/heartbeat — anti-bot fingerprint). See docs/memory/samp-client/driver.md#send-prespawn-poll.
     async fn send_prespawn_poll(&mut self) {
-        // The self-spawn fallback (`config.self_spawn_timeout`) is opt-in and OFF by default. On
-        // Arizona an unauthorised RPC_Spawn (no server `SetSpawnInfo`) trips the anti-cheat, which
-        // kicks with "подозрение в читерстве" ~60s later — verified live. A spectating client is not
-        // flagged and still receives chat/world state, so staying spectating is the safe default; the
-        // fallback exists only for non-Arizona servers that legitimately never drive the spawn.
+        // The self-spawn fallback (`config.self_spawn_timeout`) is opt-in and OFF by default (an
+        // unauthorised RPC_Spawn trips Arizona's AC). See docs/memory/samp-client/driver.md#send-prespawn-poll.
         let Some(timeout) = self.config.self_spawn_timeout else {
             return;
         };
@@ -1009,10 +1062,8 @@ impl<T: Transport> Driver<T> {
         }
         self.transition(ConnectionState::ClassSelected);
         self.class_selected_at.get_or_insert_with(Instant::now);
-        // RakSAMP Lite (`network_transport.cpp`): on a class response, if the server has already sent
-        // `SetSpawnInfo` (i.e. login is done), request spawn now — the server answers with
-        // `RequestSpawnResponse`, which spawns us. Before spawn info we keep spectating (requesting
-        // spawn early earns "ОШИБКА 7721").
+        // On a class response, request spawn only once `SetSpawnInfo` has arrived (login done); doing so
+        // early earns "ОШИБКА 7721". See docs/memory/samp-client/driver.md#on-class-response.
         if self.spawn_info_position.is_some() && self.spectating {
             self.request_spawn().await;
         }
@@ -1023,9 +1074,8 @@ impl<T: Transport> Driver<T> {
         else {
             return;
         };
-        // RakSAMP Lite's RPC_RequestSpawnResponse condition (0x45ace0): spawn when `allow == 2`, or
-        // when `allow != 0` while we explicitly requested spawn. On Arizona the server sends
-        // `allow == 2` after login — so this is the server-driven spawn, no explicit client call.
+        // Spawn when `allow == 2`, or `allow != 0` while we explicitly requested spawn; Arizona sends
+        // `allow == 2` after login. See docs/memory/samp-client/driver.md#on-spawn-response.
         let allow = response.allow;
         if allow != 2 && !(allow != 0 && self.spawn_requested) {
             tracing::debug!(allow, "server has not authorised spawn yet");
@@ -1045,14 +1095,8 @@ impl<T: Transport> Driver<T> {
         let pos = info.position;
         tracing::debug!(x = pos.x, y = pos.y, z = pos.z, "spawn info position");
         self.spawn_info_position = Some(pos);
-        // The real client answers EVERY SetSpawnInfo with RPC 52 (Spawn) — including the SECOND one the
-        // server sends right after a fresh account confirms its skin (`chooseSelector.buy`). That second
-        // Spawn is what moves the character out of the ChooseSelector room (interior 211) into the world;
-        // NOT sending it is exactly the "Игнорирование функции(52 / 1)" anti-cheat kick. The FIRST
-        // SetSpawnInfo arrives while still spectating (not yet Spawned) and is driven by the normal
-        // class/spawn-response path, so only re-send when we're ALREADY Spawned (the post-skin / respawn
-        // case). Re-send Spawn and adopt the new position, but don't re-fire the Spawned event — the FSM
-        // is already Spawned and the scripts' onSpawn already ran.
+        // Re-send Spawn (RPC 52) + adopt the position only when ALREADY Spawned (the post-skin second
+        // SetSpawnInfo), without re-firing the event. See docs/memory/samp-client/driver.md#on-set-spawn-info-respawn.
         if matches!(self.state, ConnectionState::Spawned) {
             let spawn = Spawn.encode();
             self.send_rpc(RpcId::Spawn as u8, spawn).await;
@@ -1067,9 +1111,8 @@ impl<T: Transport> Driver<T> {
         }
     }
 
-    /// `TogglePlayerSpectating` (RPC 124): the Arizona server toggles spectate ON during login and
-    /// OFF afterwards. A `1 → 0` transition means "drop out of spectate" → spawn, exactly like
-    /// RakSAMP Lite's `sub_45B260 → Net_Spawn`. This is the server-driven spawn, no explicit call.
+    /// `TogglePlayerSpectating` (RPC 124): a server `1 → 0` transition is the server-driven spawn; see
+    /// docs/memory/samp-client/driver.md#on-toggle-spectating.
     async fn on_toggle_spectating(&mut self, payload: &[u8]) {
         let Some(toggle) =
             decode_event_or_warn::<TogglePlayerSpectating>(payload, "spectating toggle")
@@ -1080,33 +1123,24 @@ impl<T: Transport> Driver<T> {
         let was_spectating = self.server_spectating;
         self.server_spectating = toggle;
         if toggle {
-            // Arms the self-spawn fallback timer even when no class response will ever arrive
-            // (an Arizona script drops the automatic RequestClass, so the server's spectate-on is
-            // then the only signal that the pre-spawn window has begun).
+            // Arm the self-spawn fallback timer: spectate-on may be the only pre-spawn-window signal.
+            // See docs/memory/samp-client/driver.md#on-toggle-spectating.
             self.class_selected_at.get_or_insert_with(Instant::now);
         }
         if was_spectating && !toggle && !matches!(self.state, ConnectionState::Spawned) {
-            // RakSAMP Lite (`network_transport.cpp`): a `1 → 0` spectate toggle routes through
-            // `RequestSpawn` (RPC 129), NOT a direct `Spawn` (RPC 52). The server then replies
-            // `RequestSpawnResponse` with `allow != 0`, which drives `enter_spawned`. Sending an
-            // unsolicited `Spawn` (skipping the RequestSpawn→allow handshake) is what Arizona's
-            // anti-cheat flags as "Игнорирование функции(52 / 1)" and kicks ~16s after spawn. Stay
-            // spectating until the server's spawn grant arrives.
+            // A `1 → 0` toggle routes through `RequestSpawn` (RPC 129), NOT a direct `Spawn` (RPC 52);
+            // the unsolicited-Spawn shortcut is the "function 52" AC kick. See docs/memory/samp-client/driver.md#on-toggle-spectating.
             self.request_spawn().await;
         }
     }
 
-    /// Send `RPC_Spawn` and enter the `Spawned` state — the single convergence point for every spawn
-    /// trigger. We spectate (spectator-sync 212) after join until one of these fires (the only
-    /// triggers the real RakSAMP Lite binary has — `Net_Spawn` xrefs at `0x455bb0`):
-    /// - `TogglePlayerSpectating` (RPC 124) on a `1 → 0` transition (`on_toggle_spectating`) — the
-    ///   Arizona post-login trigger — or `RequestSpawnResponse(allow==2)` (`on_spawn_response`).
-    /// - MANUAL: `sampSpawnPlayer()` sends `RequestSpawn`, whose response then spawns us.
+    /// Send `RPC_Spawn` and enter `Spawned` — the single convergence point for every spawn trigger; see
+    /// docs/memory/samp-client/driver.md#enter-spawned.
     async fn enter_spawned(&mut self) {
         let payload = Spawn.encode();
         self.send_rpc(RpcId::Spawn as u8, payload).await;
-        // Net_Spawn copies the SetSpawnInfo position into the local sync position — this is where the
-        // post-spawn position comes from (the class-response spawn_position is usually zero).
+        // Net_Spawn copies the SetSpawnInfo position into the sync position (class-response
+        // spawn_position is usually zero). See docs/memory/samp-client/driver.md#enter-spawned.
         match self.spawn_info_position {
             Some(pos) => self.sync.position = pos,
             None => {
@@ -1141,8 +1175,8 @@ impl<T: Transport> Driver<T> {
             position: self.sync.position,
         }
         .to_packet();
-        // The real client sends spectator sync UNRELIABLE (reliability 6, not sequenced) on the sync
-        // channel — samp.dll `sub_10006320`, `Send(..., reliability = 6, orderingChannel = 1)`.
+        // Spectator sync goes UNRELIABLE (reliability 6, not sequenced) on the sync channel; see
+        // docs/memory/samp-client/driver.md#send-spectator-sync.
         if let Err(error) = self
             .transport
             .send(packet, Reliability::Unreliable, SYNC_CHANNEL)
@@ -1187,13 +1221,11 @@ impl<T: Transport> Driver<T> {
         self.send_aim_sync().await
     }
 
-    /// Stream Arizona's custom on-foot position report (packet 221, sub-id 53) alongside stock 207.
-    /// Arizona's anti-cheat kicks a client that never sends it ("Игнорирование функции(52 / 1)"). This
-    /// is the minimal stationary form: our own entity id + current position + a monotonic ms timestamp
-    /// + the rest velocity/heading. Sent `UnreliableSequenced` on [`SYNC_CHANNEL`] like the other sync.
+    /// Stream Arizona's custom on-foot position report (packet 221, sub-id 53) alongside stock 207,
+    /// required by the AC; see docs/memory/samp-client/driver.md#send-arizona-221.
     async fn send_arizona_221_sync(&mut self) -> raknet::Result<()> {
-        // Report the server-assigned streamer id (from 221/113); fall back to our player id until it
-        // arrives. Reporting the wrong id is what the streamer watchdog flags as "function 52".
+        // Report the server-assigned streamer id (221/113), falling back to our player id; the wrong id
+        // is the "function 52" flag. See docs/memory/samp-client/driver.md#send-arizona-221.
         let packet = ArizonaSync221 {
             entity_id: self.arizona_streamer_id.unwrap_or(self.local_id.0),
             position: self.sync.position,
@@ -1209,9 +1241,8 @@ impl<T: Transport> Driver<T> {
             .inspect_err(|error| tracing::warn!(%error, "failed to send Arizona 221 sync"))
     }
 
-    /// Report player stats (`PACKET_STATS_UPDATE` = 205: money + drunk) at the [`STATS_INTERVAL`]
-    /// cadence, matching the real client's 1 Hz stats send while spawned. Sent UNRELIABLE on channel 0
-    /// like the real client (`NetGame_Process` @0x10005B10); drunk level is always 0 (headless bot).
+    /// Report player stats (`PACKET_STATS_UPDATE` = 205) at the [`STATS_INTERVAL`] 1 Hz cadence,
+    /// UNRELIABLE on channel 0; see docs/memory/samp-client/driver.md#send-stats-update.
     async fn send_stats_update(&mut self) -> raknet::Result<()> {
         let now = Instant::now();
         if self
@@ -1368,8 +1399,8 @@ impl<T: Transport> Driver<T> {
             return;
         }
 
-        // Terminal reasons: reconnecting is futile, and for a ban it just hammers the server. Stop the
-        // client cleanly (closed → next_event yields None → the app loop exits) instead of looping.
+        // Terminal reasons (ban/bad password): reconnecting is futile, so stop cleanly instead of
+        // looping. See docs/memory/samp-client/driver.md#on-disconnect-reconnect.
         if matches!(
             reason,
             DisconnectReason::Banned | DisconnectReason::InvalidPassword
@@ -1380,10 +1411,8 @@ impl<T: Transport> Driver<T> {
             return;
         }
 
-        // Everything else (kick / rejection / connection loss / timeout) is retried, but with a cap so a
-        // server that keeps dropping us straight back out can't spin forever. A session that survived at
-        // least STABLE_SESSION before dropping is treated as a one-off and resets the counter; a
-        // never-stabilising loop (kicked before/at spawn, or spawn→instant-kick) keeps accumulating.
+        // Everything else (kick/rejection/loss/timeout) is retried with a cap; a session lasting
+        // ≥STABLE_SESSION resets the counter. See docs/memory/samp-client/driver.md#on-disconnect-reconnect.
         let was_stable = self
             .connected_since
             .is_some_and(|since| since.elapsed() >= STABLE_SESSION);

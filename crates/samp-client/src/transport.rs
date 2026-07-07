@@ -1,8 +1,5 @@
-//! Transport seam between the FSM [`crate::driver::Driver`] and the RakNet layer.
-//!
-//! The [`Transport`] trait abstracts [`raknet::RakHandle`] plus its event receiver so the FSM can be
-//! driven by a scripted fake in unit tests (the real transport is exercised by the ignored
-//! end-to-end test once the sibling crates are implemented).
+//! Transport seam: the [`Transport`] trait abstracts [`raknet::RakHandle`] + its event receiver so
+//! the FSM runs against a scripted fake in tests and the real RakNet in production.
 
 use std::net::SocketAddr;
 

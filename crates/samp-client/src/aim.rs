@@ -1,14 +1,6 @@
-//! Native aim-sync emulation, ported from `aim_fix_updated.lua`.
-//!
-//! A real SA-MP client streams an aim-sync packet describing where its camera points. A bare bot
-//! never sends one, which looks unnatural. This makes the client periodically (every random 5–60 s,
-//! and only while standing still) send a believable aim packet: a camera placed ~2 units behind the
-//! bot per its facing, jittered by a small random offset, looking back at the bot. When the server
-//! repositions the bot (`SetPlayerPos`/camera RPCs) the aim is regenerated and sent promptly.
-//!
-//! The aim it produces is the high-level [`AimData`]; the driver mirrors it into
-//! [`crate::state::LocalPlayer::aim`] and (with client emulation) tweaks it before [`AimSync::encode`]
-//! packs it into the wire [`AimSyncData`].
+//! Native aim-sync emulation (ported from `aim_fix_updated.lua`): periodically, while standing still,
+//! sends a believable aim packet so a bare bot doesn't look unnatural; see
+//! docs/memory/samp-client/aim.md#module.
 
 use std::time::{Duration, Instant};
 
@@ -22,8 +14,7 @@ const ASPECT_RATIO: u8 = 85;
 const AIM_MIN_SECS: u64 = 5;
 const AIM_MAX_SECS: u64 = 60;
 
-/// Aim-sync state machine. Construct with [`AimSync::new`], feed it position updates and server
-/// repositions, then each sync tick poll [`AimSync::due`] and, when due, [`AimSync::encode`].
+/// Aim-sync state machine; see docs/memory/samp-client/aim.md#aimsync-usage.
 pub(crate) struct AimSync {
     rng: u64,
     last_pos: Vector3,
@@ -60,8 +51,7 @@ impl AimSync {
         self.schedule(now);
     }
 
-    /// Note the bot's current position (called as on-foot sync is built). A position change marks the
-    /// bot as moving, which suppresses the next aim send.
+    /// Note the bot's current position; a position change marks it moving, suppressing the next send.
     pub(crate) fn on_position(&mut self, pos: Vector3) {
         if pos != self.last_pos {
             self.bot_moved = true;
@@ -77,9 +67,8 @@ impl AimSync {
         self.next_at = Some(Instant::now() - Duration::from_secs(1)); // due now
     }
 
-    /// Whether an aim send is due (and the bot is not moving), rescheduling the next send. Moving
-    /// consumes the move flag and skips this cycle. When this returns `true`, mutate [`Self::aim_mut`]
-    /// if desired and then call [`Self::encode`].
+    /// Whether an aim send is due (and the bot is still), rescheduling the next; see
+    /// docs/memory/samp-client/aim.md#due.
     pub(crate) fn due(&mut self, now: Instant) -> bool {
         if self.bot_moved {
             self.bot_moved = false;

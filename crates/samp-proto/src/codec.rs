@@ -34,13 +34,8 @@ pub trait Decode: Packet + Sized {
     fn decode(payload: &[u8]) -> Result<Self>;
 }
 
-/// Outgoing `RPC_ClientJoin` (25). `challenge_response` is `server_cookie ^ CHALLENGE_XOR`.
-///
-/// When `duplicate_challenge_response` is set, [`ClientJoin::encode`] appends a trailing copy of
-/// `challenge_response` as a 7th field — the Arizona 0.3.7-R3 client variant (verified in
-/// `samp.dll:0x1000AA20`, where the join sender writes `challengeResponse` twice). Vanilla SA-MP
-/// reads only the first six fields and ignores the trailing bytes, so this is safe to leave on; set
-/// it `false` for a strict-vanilla join.
+/// Outgoing `RPC_ClientJoin` (25); `challenge_response = server_cookie ^ CHALLENGE_XOR`.
+/// `duplicate_challenge_response` appends the Arizona 7th-field variant; see docs/memory/samp-proto/codec.md#clientjoin-duplicate-challenge
 #[derive(Debug, Clone)]
 pub struct ClientJoin<'a> {
     pub version: u32,
@@ -57,10 +52,7 @@ impl Packet for ClientJoin<'_> {
 }
 
 impl Encode for ClientJoin<'_> {
-    /// Build the `RPC_ClientJoin` body. Field order/sizes verified against
-    /// `Net_OnConnAccepted_SendClientJoin` (0x4572C0):
-    /// `version:u32, modded:u8, nick:str8, challenge_response:u32, auth:str8, client_version:str8`.
-    /// The Arizona variant appends a duplicated `challenge_response:u32` as a 7th field.
+    /// Build the `RPC_ClientJoin` body (`Net_OnConnAccepted_SendClientJoin` @0x4572C0); layout: see docs/memory/samp-proto/codec.md#clientjoin-encode
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
         w.write_u32(self.version);
@@ -76,9 +68,7 @@ impl Encode for ClientJoin<'_> {
     }
 }
 
-// `RPC_InitGame` (139) bit layout (RPC_InitGame @0x458F90). The original handler consumes many
-// server-settings fields the client mostly discards; we replicate the exact cursor advance and
-// extract only the two fields this crate models.
+// `RPC_InitGame` (139) bit layout (@0x458F90); see docs/memory/samp-proto/codec.md#init-game-layout
 // TODO(verify): the skipped server-settings block is reproduced bit-for-bit from the binary's
 // read sequence but the semantic meaning of individual skipped fields is not modelled here.
 const INIT_GAME_BITS_BEFORE_PLAYER_ID: usize = 104;
@@ -116,9 +106,7 @@ impl Decode for InitGame {
 }
 
 impl Encode for InitGame {
-    /// Re-encode a minimal valid `RPC_InitGame`: the skipped server-settings blocks are zero-filled,
-    /// so `InitGame::decode(x.encode())` recovers `local_player_id` and `host_name` — the only two
-    /// fields this crate models. Used by the mock server / unit tests to produce a join payload.
+    /// Re-encode a minimal valid `RPC_InitGame` (server-settings zero-filled) for the mock server / tests.
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
         w.write_zero_bits(INIT_GAME_BITS_BEFORE_PLAYER_ID);
@@ -148,8 +136,7 @@ impl Encode for RequestClass {
     }
 }
 
-// Offsets within the 46-byte `PLAYER_SPAWN_INFO` blob (read by sub_401F80; field offsets confirmed
-// against Net_Spawn @0x455BB0 which reads skin@+1, position xy@+6, position z@+14).
+// Offsets within the 46-byte `PLAYER_SPAWN_INFO` blob (skin@+1, pos xy@+6, pos z@+14; `Net_Spawn` @0x455BB0).
 const SPAWN_INFO_LEN: usize = 46;
 const SPAWN_INFO_SKIN_OFFSET: usize = 1;
 const SPAWN_INFO_POS_OFFSET: usize = 6;
@@ -199,9 +186,7 @@ impl Decode for RequestClassResponse {
 }
 
 impl Encode for RequestClassResponse {
-    /// Re-encode the class-selection response (inverse of [`RequestClassResponse::decode`]): a
-    /// denied response is the single `0` allow byte; an allowed one is `1` followed by the 46-byte
-    /// spawn-info blob carrying `skin`/`spawn_position`. Used by the mock server / unit tests.
+    /// Re-encode the class-selection response (inverse of decode) for the mock server / tests.
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
         if !self.allowed {
@@ -294,10 +279,7 @@ impl Encode for Spawn {
     }
 }
 
-/// Outgoing `PACKET_STATS_UPDATE` (205): `[i32 money][i32 drunk]` (8 bytes). The real client sends
-/// this every second while spawned (`NetGame_Process` @0x10005B10 writes the id then money and the
-/// drunk level, each as a 32-bit little-endian int, `Send` UNRELIABLE on channel 0). The id byte is
-/// prepended by the transport.
+/// Outgoing `PACKET_STATS_UPDATE` (205): `[i32 money][i32 drunk]`; see docs/memory/samp-proto/codec.md#stats-update
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatsUpdate {
     pub money: i32,
@@ -317,10 +299,7 @@ impl Encode for StatsUpdate {
     }
 }
 
-/// Outgoing spectator sync body (`ID_SPECTATOR_SYNC` = 212): `lrAnalog:u16, udAnalog:u16, keys:u16,
-/// position:3xf32` (18 bytes). The real Arizona client spectates — sending this — while it answers the
-/// login dialog, and only spawns afterwards; sending on-foot sync before login earns "ОШИБКА 7721".
-/// The id byte is prepended by the transport.
+/// Outgoing spectator sync body (`ID_SPECTATOR_SYNC` = 212), sent while answering the login dialog; see docs/memory/samp-proto/codec.md#spectator-sync
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpectatorSync {
     pub position: Vector3,
@@ -346,11 +325,9 @@ impl Encode for SpectatorSync {
 /// Outgoing on-foot sync body (`ID_PLAYER_SYNC` = 207).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct OnFootSync {
-    /// Left/right analog steering (`lrAnalog@0`): the real client sends ±128 while strafing, 0
-    /// otherwise. Default 0 keeps the wire output identical to the old fixed-zero encoding.
+    /// Left/right analog steering (`lrAnalog@0`): ±128 while strafing, 0 otherwise.
     pub left_right: i16,
-    /// Up/down analog steering (`udAnalog@2`): the real client sends **−128 while moving forward**,
-    /// +128 while backing up, 0 when still. Faithful locomotion sets this alongside `keys`/`move_speed`.
+    /// Up/down analog steering (`udAnalog@2`): −128 forward, +128 backing up, 0 when still.
     pub up_down: i16,
     pub keys: u16,
     pub position: Vector3,
@@ -359,10 +336,9 @@ pub struct OnFootSync {
     pub armour: u8,
     pub weapon: WeaponId,
     pub special_action: u8,
-    /// Reported velocity (moveSpeed@38). A moving `position` with a zero `move_speed` reads as a
-    /// teleport to the server's anti-cheat, so movement must set a matching velocity here.
+    /// Reported velocity (moveSpeed@38); must match `position` motion or anti-cheat reads a teleport.
     pub move_speed: Vector3,
-    /// Animation index/flags (animIndex@64, animFlags@66). The real client sends a non-zero pair.
+    /// Animation index/flags (animIndex@64, animFlags@66); the real client sends a non-zero pair.
     pub animation_id: u16,
     pub animation_flags: u16,
 }
@@ -376,35 +352,27 @@ impl Packet for OnFootSync {
 }
 
 impl Encode for OnFootSync {
-    /// Encode the 544-bit on-foot sync body. Layout (byte offsets) ported from Net_SendInGameSync's
-    /// on-foot branch:
-    /// `lrAnalog:u16@0, udAnalog:u16@2, keys:u16@4, position:3xf32@6, quaternion:4xf32@18,
-    /// health:u8@34, armour:u8@35, weapon:u8@36, special_action:u8@37, moveSpeed:3xf32@38,
-    /// surfOffset:3xf32@50, surfVehicle:u16@62, animIndex:u16@64, animFlags:u16@66`.
-    ///
-    /// The id byte is prepended by the caller/transport.
+    /// Encode the 544-bit on-foot sync body (`Net_SendInGameSync` @0x455210 on-foot branch); layout: see docs/memory/samp-proto/codec.md#onfootsync-encode
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
-        // Left/right + up/down analog steering. Zero when idle; the walker sets up_down = -128 while
-        // moving forward, matching the real client (verified against a live 207 capture).
+        // Analog steering: zero when idle; walker sets up_down = -128 moving forward.
         w.write_u16(self.left_right as u16);
         w.write_u16(self.up_down as u16);
         w.write_u16(self.keys);
         w.write_f32(self.position.x);
         w.write_f32(self.position.y);
         w.write_f32(self.position.z);
-        // TODO(verify): quaternion component order — modelled as (x, y, z, w) to match `Quaternion`;
-        // the binary copies 16 raw bytes from the rotation state.
+        // Quaternion on the wire is (w, x, y, z) — w FIRST; wrong order tripped Arizona's "Fly Hack -
+        // Пешком(7/1)". See docs/memory/samp-proto/codec.md#onfootsync-quat-order
+        w.write_f32(self.quaternion.w);
         w.write_f32(self.quaternion.x);
         w.write_f32(self.quaternion.y);
         w.write_f32(self.quaternion.z);
-        w.write_f32(self.quaternion.w);
         w.write_u8(self.health);
         w.write_u8(self.armour);
         w.write_u8(self.weapon.0);
         w.write_u8(self.special_action);
-        // Move speed (x, y, z): the reported velocity — nonzero while the bot is moving so the
-        // server's anti-cheat sees a plausible velocity backing the position delta, not a teleport.
+        // Move speed (x, y, z): nonzero while moving so anti-cheat sees velocity, not a teleport.
         w.write_f32(self.move_speed.x);
         w.write_f32(self.move_speed.y);
         w.write_f32(self.move_speed.z);
@@ -419,14 +387,8 @@ impl Encode for OnFootSync {
     }
 }
 
-/// Arizona's custom on-foot position report (`packet 221`, sub-id `53`) — a 28-byte, byte-aligned
-/// sync the Arizona client streams alongside stock on-foot sync (207). The server anti-cheat kicks a
-/// client that never sends it ("Игнорирование функции(52 / 1)", where 52 is the inbound 221 sub-id).
-/// Layout reversed from live capture, all little-endian:
-/// `[u8 221][u8 53][u8 0][u16 entity_id][f32 x][f32 y][f32 z][u32 timestamp_ms][4B velocity]
-/// [u16 heading][u8 0x80]`. `timestamp_ms` must strictly increase (the server's replay/stall guard);
-/// `velocity`/`heading` carry the rest values ([`Self::REST_VELOCITY`]/[`Self::REST_HEADING`]) when
-/// the player is stationary.
+/// Arizona's custom on-foot position report (`packet 221`, sub-id `53`), 28-byte byte-aligned; a
+/// client that never sends it is kicked "Игнорирование функции(52/1)". See docs/memory/samp-proto/codec.md#arizona-sync-221
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ArizonaSync221 {
     pub entity_id: u16,
@@ -476,8 +438,7 @@ impl Packet for ServerMessage {
 }
 
 impl Decode for ServerMessage {
-    /// Decode `RPC_ClientMessage` (93): `[u32 colour LE][u32 len LE][text]`. Verified against Arizona
-    /// Bumble Bee live (`ffffffff 01000000 20` ⇒ white, len 1, `" "`).
+    /// Decode `RPC_ClientMessage` (93): `[u32 colour LE][u32 len LE][text]`.
     ///
     /// ```
     /// use samp_proto::{Decode, ServerMessage};
@@ -495,8 +456,7 @@ impl Decode for ServerMessage {
 }
 
 impl Encode for ServerMessage {
-    /// Re-encode a `RPC_ClientMessage` (inverse of [`ServerMessage::decode`]) so the mock server can
-    /// send coloured lines: `[u32 colour LE][u32 len LE][text]`.
+    /// Re-encode a `RPC_ClientMessage` (inverse of decode) for the mock server.
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
         w.write_u32(self.color);
@@ -537,9 +497,7 @@ impl Decode for ChatMessage {
 }
 
 impl Encode for ChatMessage {
-    /// Re-encode a player chat broadcast (inverse of [`ChatMessage::decode`]) so the mock server can
-    /// send it: `[u16 playerId LE][u8 len][text]`. The length is a single byte, so `text` is
-    /// truncated to 255 bytes.
+    /// Re-encode a player chat broadcast (inverse of decode) for the mock server; `text` truncated to 255.
     fn encode(&self) -> Vec<u8> {
         let len = self.text.len().min(u8::MAX as usize);
         let mut w = BitStreamWriter::new();
@@ -550,9 +508,7 @@ impl Encode for ChatMessage {
     }
 }
 
-/// An outgoing `RPC_Chat` (101) — what the client sends when the local player types in the chat bar:
-/// `[u8 len][text]`. `text` is raw bytes in the server's encoding; the length is a single byte, so
-/// callers must keep messages ≤ 255 bytes (longer input is truncated).
+/// An outgoing `RPC_Chat` (101), `[u8 len][text]`; `text` is raw server-encoding bytes, truncated to 255.
 #[derive(Debug, Clone)]
 pub struct ChatOutgoing<'a> {
     pub text: &'a [u8],
@@ -572,9 +528,7 @@ impl Encode for ChatOutgoing<'_> {
     }
 }
 
-/// A server→client `ShowDialog` (61). `title`/`button1`/`button2` are raw bytes (cp1251). The body
-/// text (compressed on the wire) is not decoded — only the structural fields the client needs to
-/// respond are returned.
+/// A server→client `ShowDialog` (61); structural fields only (title/buttons raw cp1251, body left undecoded).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowDialog {
     pub dialog_id: u16,
@@ -609,8 +563,7 @@ impl Decode for ShowDialog {
 }
 
 impl Encode for ShowDialog {
-    /// Re-encode the structural head of a `ShowDialog` (inverse of [`ShowDialog::decode`]) so the
-    /// mock server can prompt a dialog. The undecoded trailing body is omitted (decode ignores it).
+    /// Re-encode the structural head of a `ShowDialog` (inverse of decode) for the mock server.
     fn encode(&self) -> Vec<u8> {
         let mut w = BitStreamWriter::new();
         w.write_u16(self.dialog_id);
@@ -623,15 +576,10 @@ impl Encode for ShowDialog {
 }
 
 impl ShowDialog {
-    /// Decode the dialog BODY (the info text / list rows) that [`Self::decode`] skips — it follows the
-    /// head fields and is SA-MP Huffman-encoded (StringCompressor), same as 3D-text-label text. For
-    /// list/tablist dialogs this is the selectable options, `\n`-separated. Returns raw cp1251 bytes
-    /// (empty if the head is malformed or there is no body). Kept off the hot `decode` path so the
-    /// structural response path stays allocation-light.
+    /// Decode the dialog BODY (Huffman-encoded info text / list rows) that [`Self::decode`] skips; returns raw cp1251 bytes.
+    /// See docs/memory/samp-proto/codec.md#showdialog-body
     pub fn body(payload: &[u8]) -> Vec<u8> {
-        // The head is byte-aligned: `[u16 dialogId][u8 style][u8 tLen][title][u8 b1Len][b1][u8 b2Len]
-        // [b2]`. Walk it by byte offset to find where the body starts, then Huffman-decode the rest
-        // (the same StringCompressor `decode_string` that `readEncoded` uses).
+        // Walk the byte-aligned head (`[u16 dialogId][u8 style]` + three str8) by offset, then Huffman-decode the rest.
         let mut off = 3usize; // [u16 dialog_id] + [u8 style]
         for _ in 0..3 {
             let len = match payload.get(off) {
@@ -685,10 +633,7 @@ impl Encode for DialogResponse<'_> {
 }
 
 /// Read the assigned player id + server cookie from a `CONNECTION_REQUEST_ACCEPTED` body.
-///
-/// Verified against samp.dll sub_1000AA20: the body (after the RakNet id byte) is `[u32 external IP]
-/// [u16 port][u16 systemIndex][u32 cookie]`. The systemIndex is the assigned local player id; the
-/// cookie XORed with [`crate::CHALLENGE_XOR`] (0xFD9) becomes the `ClientJoin` challenge response.
+/// See docs/memory/samp-proto/codec.md#parse-connect
 pub fn parse_connect(body: &[u8]) -> Result<(PlayerId, ServerCookie)> {
     let mut reader = BitStreamReader::new(body);
     let _ip = reader.read_u32()?;
@@ -698,9 +643,7 @@ pub fn parse_connect(body: &[u8]) -> Result<(PlayerId, ServerCookie)> {
     Ok((player_id, cookie))
 }
 
-/// Best-effort gpci/auth token (`Key`). open.mp accepts any token whose value is divisible by
-/// 1001; the exact bytes of the original client's `rand()` stream are neither reproducible nor
-/// required, and callers may override.
+/// Best-effort gpci/auth token (`Key`) — open.mp accepts any value divisible by 1001; callers may override.
 pub fn generate_gpci() -> String {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -709,11 +652,7 @@ pub fn generate_gpci() -> String {
     generate_gpci_seeded(seed)
 }
 
-/// Deterministic variant of [`generate_gpci`] for reproducible tests: the same `seed` always
-/// yields the same token.
-///
-/// open.mp validates the token (`Key`) by parsing it as a base-16 integer and requiring it to be
-/// divisible by 1001 (`legacy_network_impl.cpp`), so the token is `hex(random_96_bit * 1001)`.
+/// Deterministic variant of [`generate_gpci`] for reproducible tests; token is `hex(random_96_bit * 1001)` (open.mp requires divisible-by-1001).
 pub fn generate_gpci_seeded(seed: u64) -> String {
     let mut state = seed;
     let hi = u128::from(next_rand(&mut state));

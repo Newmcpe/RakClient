@@ -1,9 +1,5 @@
-//! SA-MP field primitives layered on the raw [`BitStreamReader`]/[`BitStreamWriter`].
-//!
-//! These mirror `samp/events/bitstream_io.lua`: the higher-level wire types (length-prefixed and
-//! fixed strings, `bool8`/`bool32`, the compressed quaternion/vector forms) that the RPC and packet
-//! codecs are built from. Compressed forms are computed in `f64` to match the reference Lua's
-//! double-precision arithmetic, then narrowed to the wire integer.
+//! SA-MP field primitives layered on [`BitStreamReader`]/[`BitStreamWriter`] (mirrors
+//! `samp/events/bitstream_io.lua`); compressed forms compute in `f64` to match the reference Lua.
 
 use crate::bitstream::{BitStreamReader, BitStreamWriter};
 use crate::{Quaternion, Result, Vector3};

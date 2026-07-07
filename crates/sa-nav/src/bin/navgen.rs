@@ -1,14 +1,4 @@
-//! `navgen` — build an on-foot navmesh for a region of the SA world and write it
-//! as a `.nav` file (SA-space, see `sa_nav::NavMesh`).
-//!
-//! Usage:
-//!   navgen <gta3.img> <data-dir> <out.nav> [objects.csv] [cx cy half]
-//!
-//! The world is assembled exactly like the viewer (collision + streamer bin +
-//! IPLs, plus the streamed-objects CSV overlay if given), culled to the region
-//! square `[cx±half, cy±half]` (SA x/y), converted to Y-up, and fed through the
-//! tiled Recast pipeline. Everything but the largest connected component (roofs,
-//! fenced pockets) is dropped — the bot can only start from the ground.
+//! `navgen` — build an on-foot navmesh for a SA-world region and write it as a `.nav` file; see docs/memory/sa-nav/navgen.md#module-overview
 
 use std::collections::HashMap;
 
@@ -70,7 +60,23 @@ fn main() {
         std::process::exit(1);
     }
 
-    let cfg = sa_nav::onfoot_config();
+    let mut cfg = sa_nav::onfoot_config();
+    // Bake tunables overridable from the environment for experiments (obstacle carving
+    // vs terrain fragmentation) without recompiling: e.g. NAV_CLIMB=0.4 carves a low
+    // коряга/stump the default 0.9 m climb steps over.
+    let envf = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
+    if let Some(v) = envf("NAV_CLIMB") {
+        cfg.agent_max_climb = v;
+    }
+    if let Some(v) = envf("NAV_RADIUS") {
+        cfg.agent_radius = v;
+    }
+    if let Some(v) = envf("NAV_CELL") {
+        cfg.cell_size = v;
+    }
+    if let Some(v) = envf("NAV_SLOPE") {
+        cfg.walkable_slope_angle = v;
+    }
     eprintln!(
         "building navmesh (cell {} m, agent r={} h={} climb={} slope={}°, tiled 64 m)…",
         cfg.cell_size,
@@ -148,14 +154,7 @@ fn load_objects_csv(path: &str) -> Vec<(i32, sa_map::Vec3, sa_map::Vec3)> {
     out
 }
 
-/// Keep triangles whose SA-xy bbox intersects the region square; compact the verts
-/// and convert each to recast Y-up space.
-///
-/// Winding is NORMALISED to face up: SA collision meshes carry no winding contract
-/// (the engine treats them double-sided), but rerecast's walkable-slope test reads
-/// the SIGNED +Y normal — a ground triangle wound "down" reads non-walkable and
-/// punches a hole, fragmenting the terrain into hundreds of pockets (observed:
-/// 71 components on a flat 400 m region before this).
+/// Keep triangles whose SA-xy bbox intersects the region square, compact verts, convert to recast Y-up, and normalise winding up; see docs/memory/sa-nav/navgen.md#cull-region
 fn cull_region(mesh: &sa_map::Mesh, cx: f32, cy: f32, half: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     let (x0, x1, y0, y1) = (cx - half, cx + half, cy - half, cy + half);
     let mut remap: HashMap<u32, u32> = HashMap::new();

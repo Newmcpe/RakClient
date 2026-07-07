@@ -1,17 +1,4 @@
-//! Navmesh generation + storage for the SA world, built on the local
-//! `navmesh-recast` fork (pure-Rust Recast rewrite).
-//!
-//! Coordinate contract: everything in THIS crate's public types is **SA space**
-//! (Z-up, the coordinates the bot lives in). Recast wants Y-up; the conversion is
-//! the same handedness-preserving mapping the viewer uses for Bevy:
-//! `SA (x, y, z) -> recast (x, z, -y)` and back `recast (X, Y, Z) -> SA (X, -Z, Y)`.
-//! Converting BEFORE the build (not after) matters: rerecast's walkable-slope test
-//! reads the signed +Y component of each triangle normal, so both the axis swap
-//! and the winding it implies must match.
-//!
-//! The `.nav` file stores the flat convex-poly navmesh (verts + polys with
-//! per-edge adjacency + areas) and the terrain-following detail triangles — the
-//! polys drive A*, the detail tris drive height lookup and rendering.
+//! Navmesh generation + storage for the SA world (SA-space public types); see docs/memory/sa-nav/lib.md#module-overview
 
 use std::io::{Read, Write};
 
@@ -28,13 +15,8 @@ pub fn recast_to_sa(v: [f32; 3]) -> [f32; 3] {
     [v[0], -v[2], v[1]]
 }
 
-/// Build parameters for a SA-MP on-foot player agent.
+/// Build parameters for a SA-MP on-foot player agent; see docs/memory/sa-nav/lib.md#onfoot-config
 #[cfg(feature = "build")]
-///
-/// Height ~1.8 m (SA ped), radius 0.35 m (capsule), climb 0.9 m (the engine steps
-/// pedestrians up ~1 m ledges/stairs), slope 45° (peds walk hills the vanilla map
-/// leans on heavily; steeper reads as cliff). Cell 0.25 m keeps doorways (~1 m)
-/// and the sawmill's inter-object passages open after radius erosion of one cell.
 pub fn onfoot_config() -> navmesh_recast::BuildConfig {
     navmesh_recast::BuildConfig {
         cell_size: 0.25,
@@ -52,8 +34,7 @@ pub fn onfoot_config() -> navmesh_recast::BuildConfig {
     }
 }
 
-/// A navmesh in SA space: the runtime artifact `navgen` writes and the bot loads.
-/// Same shape as [`PolyNavmesh`], with all coordinates converted back to SA.
+/// A navmesh in SA space (the `.nav` artifact `navgen` writes and the bot loads): same shape as [`PolyNavmesh`] with coordinates converted back to SA.
 #[derive(Clone, Debug, Default)]
 pub struct NavMesh {
     pub verts: Vec<[f32; 3]>,

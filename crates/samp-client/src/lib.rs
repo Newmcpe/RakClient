@@ -1,15 +1,6 @@
-//! SA-MP connection state machine and high-level [`Client`].
-//!
-//! Drives the reversed connect → play sequence over the [`raknet`] transport using [`samp_proto`]
-//! codecs:
-//!
-//! ```text
-//! Disconnected → Connecting → RakNetConnected → Joining → Joined
-//!   → ClassSelection → ClassSelected → Spawned
-//! ```
-//!
-//! The crate root holds the public contract; the FSM lives in the private [`driver`] module driven
-//! over the [`transport`] seam.
+//! SA-MP connection state machine and high-level [`Client`]: the crate root holds the public
+//! contract; the FSM lives in the private [`driver`] module over the [`transport`] seam; see
+//! docs/memory/samp-client/lib.md#module.
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -49,8 +40,8 @@ pub enum ClientError {
 pub struct ClientConfig {
     pub server: SocketAddr,
     pub nick: String,
-    /// RakNet connection password (the server-level password sent in `CONNECTION_REQUEST`). `None`
-    /// for open servers like Arizona — this is *not* the account login password.
+    /// RakNet connection password (`CONNECTION_REQUEST`), `None` for open servers like Arizona — *not*
+    /// the account login password.
     pub password: Option<String>,
     pub client_version: String,
     pub default_class: ClassId,
@@ -58,10 +49,8 @@ pub struct ClientConfig {
     pub gpci: Option<String>,
     pub sync_interval: Duration,
     pub reconnect_delay: Duration,
-    /// If set, and the server never drives the spawn (`SetSpawnInfo`/`TogglePlayerSpectating`),
-    /// self-spawn after this long in the pre-spawn window. `None` ⇒ never self-spawn: stay
-    /// spectating (the correct mode for Arizona, whose anti-cheat kicks an unauthorised RPC_Spawn as
-    /// "подозрение в читерстве"; a spectating client still receives chat/world state).
+    /// If set, self-spawn after this long when the server never drives the spawn; `None` ⇒ stay
+    /// spectating (correct for Arizona). See docs/memory/samp-client/lib.md#self-spawn-timeout.
     pub self_spawn_timeout: Option<Duration>,
     /// Optional SOCKS5 proxy to tunnel the UDP game traffic through (fresh source IP).
     pub proxy: Option<raknet::ProxyConfig>,
@@ -202,10 +191,8 @@ impl Client {
         Ok(Self { driver })
     }
 
-    /// Connect with a [`PacketRegistry`] attached: registered handlers (scripts/observers) intercept
-    /// every incoming/outgoing RPC before the FSM, and `on_update` handlers fire on the driver's
-    /// update tick. The registry holds non-`Send` script closures, so a client built this way is
-    /// itself `!Send` — drive it inline (do not `tokio::spawn` it).
+    /// Connect with a [`PacketRegistry`] attached; the resulting client is `!Send` (holds script
+    /// closures) — drive it inline. See docs/memory/samp-client/lib.md#connect-with-registry.
     pub async fn connect_with_registry(
         config: ClientConfig,
         registry: PacketRegistry,
@@ -234,9 +221,8 @@ impl Client {
         self.driver.next_event().await
     }
 
-    /// Send a chat line as the local player (`RPC_Chat`). `text` is raw bytes in the server's
-    /// encoding — for Cyrillic (Arizona) servers, encode to cp1251 first; ASCII passes through. The
-    /// length is a single byte so `text` is truncated to 255 bytes.
+    /// Send a chat line as the local player (`RPC_Chat`); `text` is raw server-encoding bytes (cp1251
+    /// for Arizona), truncated to 255 bytes (single-byte length).
     pub async fn send_chat(&mut self, text: &[u8]) {
         self.driver.send_chat(text).await;
     }
@@ -254,10 +240,8 @@ mod e2e_tests {
 
     use test_support::MockSampServer;
 
-    /// Full stack over loopback UDP: the real [`raknet`] transport drives the connect → spawn
-    /// handshake against [`MockSampServer`], which frames its replies through the same
-    /// [`raknet::wire`] primitives. Each phase is wrapped in a [`tokio::time::timeout`] so a future
-    /// wire-framing regression fails fast instead of hanging.
+    /// Full stack over loopback UDP against [`MockSampServer`]; see
+    /// docs/memory/samp-client/lib.md#e2e-reaches-spawned.
     #[tokio::test]
     #[ignore = "e2e: real loopback raknet transport + mock server; run with --include-ignored"]
     async fn end_to_end_reaches_spawned() {
@@ -281,10 +265,8 @@ mod e2e_tests {
         assert!(reached_spawned, "client should reach Spawned");
         assert_eq!(client.state(), &ConnectionState::Spawned);
 
-        // Keep pumping the FSM so the on-foot sync timer fires, and wait for the mock to record at
-        // least one sync packet. `next_event` ticks syncs internally without yielding an event, and a
-        // `Client` is `!Send` (it may carry script handlers), so the pump runs concurrently on this
-        // task via `select!` rather than a spawned task — the wait branch wins once a sync lands.
+        // Pump the FSM (ticks syncs internally) concurrently with the wait via `select!` since a
+        // `Client` is `!Send`; see docs/memory/samp-client/lib.md#e2e-reaches-spawned.
         let got_sync = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 _ = async { while client.next_event().await.is_some() {} } => {}

@@ -6,7 +6,7 @@
 
 use mlua::Lua;
 use samp_client::{InVehicleData, SharedLocalPlayer};
-use samp_proto::Vector3;
+use samp_proto::{Quaternion, Vector3};
 
 /// Install `getBot*`/`setBot*`, `getServerAddress`, `updateSync`, `reconnect` bound to `state`.
 pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()> {
@@ -52,6 +52,28 @@ pub fn install_bindings(lua: &Lua, state: SharedLocalPlayer) -> mlua::Result<()>
         "setBotVelocity",
         lua.create_function(move |_, (x, y, z): (f32, f32, f32)| {
             s.borrow_mut().on_foot.move_speed = Vector3 { x, y, z };
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    globals.set(
+        "setBotFacing",
+        // Face the horizontal direction (dx, dy) — e.g. the direction of travel. Builds the on-wire
+        // quaternion about world +Z (w=cos(φ/2), z=sin(φ/2), φ=atan2(dx, dy)), the same encoding the
+        // real client sends and the native walker uses. Remote players derive our facing entirely from
+        // this quaternion, so a script doing setBotPosition-driven moves (the chop walk-in) can finally
+        // face where it walks instead of sliding sideways. No-op for a zero vector (keeps current facing).
+        lua.create_function(move |_, (dx, dy): (f32, f32)| {
+            if dx != 0.0 || dy != 0.0 {
+                let phi = dx.atan2(dy);
+                let (sin, cos) = (phi * 0.5).sin_cos();
+                s.borrow_mut().on_foot.quaternion = Quaternion {
+                    x: 0.0,
+                    y: 0.0,
+                    z: sin,
+                    w: cos,
+                };
+            }
             Ok(())
         })?,
     )?;

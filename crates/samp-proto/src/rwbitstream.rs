@@ -1,11 +1,6 @@
-//! Seekable read+write bitstream backing the Lua `bitStream` userdata.
-//!
-//! Unlike the append-only [`crate::BitStreamWriter`] / forward-only [`crate::BitStreamReader`]
-//! (kept untouched — 150+ codecs depend on them), this type owns one buffer with independent read
-//! and write cursors and supports `setReadOffset`/`setWriteOffset`, so a script can read an incoming
-//! packet and overwrite fields in place. Bit packing is MSB-first per byte, matching RakNet (and the
-//! other two types); it is implemented bit-by-bit for obviously-correct overwrite semantics — packet
-//! bodies are tiny, so the cost is irrelevant.
+//! Seekable read+write bitstream backing the Lua `bitStream` userdata — one buffer, independent
+//! read/write cursors (`setReadOffset`/`setWriteOffset`) for in-place field rewrites, MSB-first.
+//! See docs/memory/samp-proto/rwbitstream.md#module
 
 use crate::{ProtoError, Result};
 
@@ -103,9 +98,7 @@ impl RwBitStream {
         (self.data[pos >> 3] & (0x80u8 >> (pos & 7))) != 0
     }
 
-    /// Write the `num_bits` bits of `input` (MSB-first per byte) at the write cursor, overwriting any
-    /// existing bits. `right_aligned` shifts a trailing partial (`< 8`) byte so its low bits are the
-    /// ones written — matching `BitStream::WriteBits(.., true)`.
+    /// Write `num_bits` of `input` (MSB-first) at the write cursor, overwriting; `right_aligned` shifts a trailing partial byte to its low bits.
     fn write_bits(&mut self, input: &[u8], num_bits: usize, right_aligned: bool) {
         let mut remaining = num_bits;
         let mut offset = 0;
@@ -127,9 +120,7 @@ impl RwBitStream {
         }
     }
 
-    /// Read `num_bits` bits from the read cursor into `ceil(num_bits / 8)` bytes (MSB-first).
-    /// `align_right` shifts a trailing partial byte into the low bits. Errors when the stream does
-    /// not hold enough bits.
+    /// Read `num_bits` from the read cursor into `ceil(num_bits / 8)` bytes (MSB-first, `align_right` low-aligns a partial byte); errors when short.
     fn read_bits(&mut self, num_bits: usize, align_right: bool) -> Result<Vec<u8>> {
         if self.read_pos + num_bits > self.num_bits {
             return Err(ProtoError::Exhausted {
@@ -226,9 +217,7 @@ impl RwBitStream {
         self.write_bytes(&encoded);
     }
 
-    /// `bitStream:readEncoded(max_len)` — inverse of [`Self::write_encoded`]. Encoded strings are the
-    /// last field of their packet (ShowDialog/3D-text body), so this decodes from the (byte-aligned)
-    /// read cursor to the end and consumes the rest of the stream.
+    /// `bitStream:readEncoded(max_len)` — inverse of [`Self::write_encoded`]; decodes from the byte-aligned read cursor to the end, consuming the rest.
     pub fn read_encoded(&mut self, max_len: usize) -> Vec<u8> {
         self.align_read_to_byte();
         let start = self.read_pos / 8;

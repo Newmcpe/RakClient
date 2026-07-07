@@ -225,10 +225,12 @@ fn on_foot_sync_layout() {
     assert_eq!(r.read_f32().unwrap(), 1.0);
     assert_eq!(r.read_f32().unwrap(), 2.0);
     assert_eq!(r.read_f32().unwrap(), 3.0);
-    assert_eq!(r.read_f32().unwrap(), 0.1);
-    assert_eq!(r.read_f32().unwrap(), 0.2);
-    assert_eq!(r.read_f32().unwrap(), 0.3);
-    assert_eq!(r.read_f32().unwrap(), 0.4);
+    // Quaternion on the wire is (w, x, y, z) — w FIRST (samp.dll offset 0x12). The struct holds
+    // x=0.1, y=0.2, z=0.3, w=0.4, so the wire order is 0.4, 0.1, 0.2, 0.3.
+    assert_eq!(r.read_f32().unwrap(), 0.4); // quat w
+    assert_eq!(r.read_f32().unwrap(), 0.1); // quat x
+    assert_eq!(r.read_f32().unwrap(), 0.2); // quat y
+    assert_eq!(r.read_f32().unwrap(), 0.3); // quat z
     assert_eq!(r.read_u8().unwrap(), 100); // health
     assert_eq!(r.read_u8().unwrap(), 50); // armour
     assert_eq!(r.read_u8().unwrap(), 24); // weapon

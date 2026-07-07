@@ -1,15 +1,5 @@
-//! SA-MP 0.3.7 wire protocol — pure codecs, no I/O.
-//!
-//! This crate is the **public contract** other crates compile against. The bit-packing and the
-//! RPC/sync layouts are ports of the original 0.3.7 client (verified against the binary's
-//! `BitStream_WriteBits`/`BitStream_ReadBits`, the `RPC_ClientJoin` handshake, `RPC_InitGame`,
-//! the class/spawn request paths, and the on-foot branch of the in-game sync sender).
-//!
-//! Provenance highlights (verified in the binary):
-//! - RakNet bit order: bits are packed MSB-first within a byte; multi-byte integers are stored in
-//!   little-endian byte order, then bit-packed.
-//! - `ClientJoin`: `version = 4057`, `challenge_response = server_cookie ^ 0xFD9`.
-//! - On-foot sync body is exactly 544 bits / 68 bytes.
+//! SA-MP 0.3.7 wire protocol — pure codecs, no I/O. The public contract other crates compile
+//! against; reversed provenance highlights: see docs/memory/samp-proto/lib.md#module-provenance
 #![forbid(unsafe_code)]
 
 mod bitstream;
@@ -101,10 +91,8 @@ pub enum Direction {
 /// these and puts them on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundMsg {
-    /// A raw application packet (`data[0]` = id). `reliability` is the RakNet wire value
-    /// (`0..=4` = Unreliable/UnreliableSequenced/Reliable/ReliableOrdered/ReliableSequenced) so
-    /// this crate stays raknet-free; the driver maps it to `raknet::Reliability`. `sendPacket()`
-    /// defaults to reliable-ordered (`3`) on channel `0` — the Arizona `220` path.
+    /// A raw application packet (`data[0]` = id); `reliability`/`channel` map to `raknet::Reliability`.
+    /// See docs/memory/samp-proto/lib.md#outboundmsg-packet
     Packet {
         data: Vec<u8>,
         reliability: u8,
@@ -137,10 +125,7 @@ pub const SAMP_VERSION_0_3_7: u32 = 4057;
 /// `challenge_response = server_cookie ^ CHALLENGE_XOR` (verified in the join sender).
 pub const CHALLENGE_XOR: u32 = 0xFD9;
 
-/// Unicode scalar values for Windows-1251 (cp1251) bytes `0x80..=0xFF`. SA-MP Russian servers
-/// (Arizona) send chat/system text in cp1251, so chat bytes must be transcoded for display.
-/// `0x98` is unassigned in cp1251 and maps to the replacement character. `0xC0..=0xFF` is the
-/// contiguous `А..я` block and is computed rather than tabled.
+/// Unicode scalar values for cp1251 bytes `0x80..=0xFF`; see docs/memory/samp-proto/lib.md#cp1251-high
 #[rustfmt::skip]
 const CP1251_HIGH: [char; 64] = [
     'Ђ','Ѓ','‚','ѓ','„','…','†','‡','€','‰','Љ','‹','Њ','Ќ','Ћ','Џ',
@@ -149,9 +134,7 @@ const CP1251_HIGH: [char; 64] = [
     '°','±','І','і','ґ','µ','¶','·','ё','№','є','»','ј','Ѕ','ѕ','ї',
 ];
 
-/// Decode a Windows-1251 (cp1251) byte string to a Rust `String`. ASCII (`< 0x80`) passes through;
-/// `0x80..=0xBF` use [`CP1251_HIGH`]; `0xC0..=0xFF` map linearly to `U+0410..=U+044F`. Lossless for
-/// all defined cp1251 bytes — used to render SA-MP chat ([`ServerMessage`]/[`ChatMessage`]) text.
+/// Decode a Windows-1251 (cp1251) byte string to a `String` (lossless for defined bytes); renders SA-MP chat.
 ///
 /// ```
 /// use samp_proto::decode_cp1251;
@@ -169,9 +152,7 @@ pub fn decode_cp1251(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Encode a UTF-8 string to Windows-1251 (cp1251) bytes — the inverse of [`decode_cp1251`]. ASCII
-/// passes through; `U+0410..=U+044F` map linearly to `0xC0..=0xFF`; other cp1251-representable
-/// characters are looked up in [`CP1251_HIGH`]; anything with no cp1251 mapping becomes `?`.
+/// Encode a UTF-8 string to Windows-1251 (cp1251) bytes — inverse of [`decode_cp1251`]; unmapped chars become `?`.
 ///
 /// ```
 /// use samp_proto::encode_cp1251;
