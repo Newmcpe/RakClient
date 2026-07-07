@@ -1,38 +1,35 @@
 # RakClient: a headless async SA-MP 0.3.7 client (Rust / Tokio)
 
-RakClient is a headless, autonomous SA-MP 0.3.7 client for writing in-game scenarios. There is no GTA
-San Andreas, no game engine, and no rendering. A normal SA-MP client is GTA:SA plus `samp.dll`;
-RakClient never launches the game and speaks the wire protocol directly. The protocol was
-reverse-engineered from `RakSAMP Lite.exe`, so it connects to a real 0.3.7 server, plays through the
-whole connection-to-spawn sequence, and then runs whatever you script for it: jobs, automation, a chat
-bridge, or anything else you write in Lua.
+RakClient is a self-sufficient SA-MP 0.3.7 client for interacting with servers without launching the
+original game, built first and foremost for **Arizona RP**. It plays the whole connection-to-spawn
+sequence and then runs whatever you script for it — jobs, automation, an Android↔PC chat bridge, or
+anything else you write in Lua.
 
-```
-Disconnected -> Connecting -> RakNet-connected -> Joining (ClientJoin)
--> Joined (InitGame) -> ClassSelection -> ClassSelected -> Spawned -> InGame (on-foot sync)
-```
+It grows out of [RakSAMP Lite](https://www.blast.hk/threads/108052/) — the lightweight client that inspired it, whose
+protocol it covers in full — and goes further: a real navmesh, a native walker, and a first-class Luau
+host tuned for Arizona's servers.
 
 You write behaviour as Lua (Luau) scripts against a host API that mirrors MoonLoader / SAMP.Lua, so a
-script hooks every RPC and packet the same way it would inside the real game. Under that sits the
-SA-MP "RakNet 3.x" reliable/ordered UDP transport, the per-datagram byte cipher, and the connection
-state machine.
+script hooks every RPC and packet the same way it would inside the real game. Under that sits the SA-MP
+"RakNet 3.x" reliable/ordered UDP transport, the per-datagram byte cipher, and the connection state
+machine.
 
 [Документация на русском](README.ru.md)
 
 ## Walking like a real player
 
-The bot moves over a real navigation mesh built from the server's own map, and it walks with the
-GTA-SA gaits: walk, jog, and sprint, at speeds and animations measured from a live capture of the game
-client (`walkTo(x, y, z, "walk"|"jog"|"sprint")`). A script asks it to go somewhere and it finds a
-path around the props and buildings, reporting a matching analog input, velocity, and animation so it
-reads as a genuine player to everyone else on the server.
+The bot moves over a real navigation mesh built from the server's own map, and it walks with the GTA-SA
+gaits: walk, jog, and sprint, at speeds and animations measured from a live capture of the game client
+(`walkTo(x, y, z, "walk"|"jog"|"sprint")`). A script asks it to go somewhere and it finds a path around
+the props and buildings, ramping up to speed and reporting a matching analog input, velocity, and
+animation so it reads as a genuine player to everyone else on the server.
 
 Below is the offline viewer showing Arizona RP's sawmill, reconstructed from the game files, with a
 navmesh route (yellow) planned across the yard. The green carpet is the walkable surface.
 
 ![Sawmill navmesh, top-down](docs/img/sawmill-navmesh-top.png)
 
-![Sawmill navmesh, ground level](docs/img/sawmill-navmesh-ground.png)
+![Sawmill navmesh, path through the forest yard](docs/img/sawmill-navmesh-forest.png)
 
 ## Workspace layout
 
@@ -56,8 +53,8 @@ cargo run -p app -- --server <host:port> --nick <Nick> [--scripts-dir example_sc
 ```
 
 The binary is `rakclient`, not the crate name `app`. Set `RUST_LOG=info` for logs, or
-`raknet::transport=trace` to see every datagram as hex. Pass `--navmesh <file.nav>` to enable the
-native `walkTo` walker in scripts.
+`raknet::transport=trace` to see every datagram as hex. Pass `--navmesh <file.nav>` to enable the native
+`walkTo` walker in scripts.
 
 ## World and navigation tools
 
@@ -96,14 +93,6 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
-
-## Protocol provenance
-
-The wire format was recovered from the original binary: the RPC id table, `BitStream` semantics, the
-ClientJoin handshake (`version=4057`, `challengeResponse = cookie ^ 0xFD9`), the on-foot sync layout,
-and the port-keyed byte cipher with its 256-byte substitution table. The on-foot gait speeds and
-animations were measured from a live 207 capture. Wire layouts are byte-exact ports verified against
-the binary; they change only with a golden-vector test.
 
 ## License
 
