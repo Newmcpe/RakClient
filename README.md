@@ -6,8 +6,8 @@ sequence and then runs whatever you script for it — jobs, automation, an Andro
 anything else you write in Lua.
 
 It grows out of [RakSAMP Lite](https://www.blast.hk/threads/108052/) — the lightweight client that inspired it, whose
-protocol it covers in full — and goes further: a real navmesh, a native walker, and a first-class Luau
-host tuned for Arizona's servers.
+protocol it covers in full — and goes further: a real navmesh, a native walker, and a scripting host
+built on typed Luau (static typing over plain dynamic Lua).
 
 You write behaviour as Lua (Luau) scripts against a host API that mirrors MoonLoader / SAMP.Lua, so a
 script hooks every RPC and packet the same way it would inside the real game. Under that sits the SA-MP
