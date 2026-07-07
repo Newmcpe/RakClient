@@ -5,9 +5,9 @@ original game, built first and foremost for **Arizona RP**. It plays the whole c
 sequence and then runs whatever you script for it — jobs, automation, an Android↔PC chat bridge, or
 anything else you write in Lua.
 
-It grows out of [RakSAMP Lite](https://www.blast.hk/threads/108052/) — the lightweight client that inspired it, whose
-protocol it covers in full — and goes further: a real navmesh, a native walker, and a scripting host
-built on typed Luau (static typing over plain dynamic Lua).
+It grows out of [RakSAMP Lite](https://www.blast.hk/threads/108052/) — the lightweight client I drew
+inspiration from and whose protocol I covered in full — and goes further: a real navmesh, a native
+walker, and a scripting host built on typed Luau (static typing over plain dynamic Lua).
 
 You write behaviour as Lua (Luau) scripts against a host API that mirrors MoonLoader / SAMP.Lua, so a
 script hooks every RPC and packet the same way it would inside the real game. Under that sits the SA-MP
